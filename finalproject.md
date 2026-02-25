@@ -15,7 +15,7 @@ Pixel-wise semantic segmentation (Pixel-wise classification) separating dendrite
 - Saturation artifacts ("burned" regions)
 - Charging Effect blur
 - Soft gradients at boundaries
-- Treat intensity as topographic height map — do not rely on global thresholds alone
+- Treat intensity as topographic height map (one suggested idea among multiple valid approaches), and do not rely on global thresholds alone
 
 **Required outputs:**
 1. Binary Mask separating dendrite from background
@@ -29,6 +29,7 @@ Pixel-wise semantic segmentation (Pixel-wise classification) separating dendrite
 - Use SOTA models: YOLOv8/v11
 - Transfer Learning for non-linear pattern recognition
 - High data dependency: requires accurately labeled supervised dataset
+- Model quality depends directly on data and annotation quality
 - High robustness to complex texture changes
 - **Labeling method:** must use Polygons only
 - **Recommended labeling tools:**
@@ -85,6 +86,8 @@ Pixel-wise semantic segmentation (Pixel-wise classification) separating dendrite
 
 ## Submission Requirements
 
+Submit as a single `.zip` folder containing all components below.
+
 ### A. Summary Report (PDF)
 Technical paper structure:
 1. Abstract: problem definition, chosen solution, main results
@@ -104,3 +107,7 @@ Technical paper structure:
 
 ### D. Presentation
 5-minute presentation including a live demo with a recorded video of the algorithm running on a new dataset.
+
+### E. Dataset Access
+To receive the project dataset, register using:
+https://forms.gle/zeTSoa78uBNgLrMM7
