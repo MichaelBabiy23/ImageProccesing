@@ -19,10 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
 from classic_pipeline import run_classic_pipeline, process_all_images, skeletonize_mask
-from evaluate import (
-    create_comparison_figure, evaluate_all, generate_metrics_summary,
-    evaluate_single, analyze_failures, format_failure_report,
-)
+from evaluate import create_comparison_figure, evaluate_all
 from utils import load_image, save_image, list_images
 
 
