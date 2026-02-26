@@ -10,6 +10,7 @@ Four-stage pipeline:
 Plus skeletonization via Zhang-Suen thinning.
 """
 
+import argparse
 import cv2
 import numpy as np
 import os
@@ -511,39 +512,94 @@ def process_all_images(input_dir, output_dir):
     return all_results
 
 
+# ===========================================================================
+# CLI entry point
+# ===========================================================================
+
+def main():
+    """Argparse CLI for the classic segmentation pipeline."""
+    parser = argparse.ArgumentParser(
+        description="Classic CV pipeline for SEM dendrite segmentation"
+    )
+    parser.add_argument(
+        "image", nargs="?", default=None,
+        help="Path to a single SEM image (omit for batch mode with --input)"
+    )
+    parser.add_argument(
+        "--input", default=None,
+        help="Directory of SEM images for batch processing"
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="Output directory (default: output/classic/)"
+    )
+    parser.add_argument(
+        "--no-intermediates", action="store_true",
+        help="Only save final mask and skeleton, not intermediate stages"
+    )
+
+    args = parser.parse_args()
+
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = args.output or os.path.join(project_dir, "output", "classic")
+
+    if args.image:
+        # Single image mode
+        if not os.path.isfile(args.image):
+            print(f"Error: Image not found: {args.image}")
+            sys.exit(1)
+        run_classic_pipeline(
+            args.image, output_dir,
+            save_intermediates=not args.no_intermediates
+        )
+    elif args.input:
+        # Batch mode
+        if not os.path.isdir(args.input):
+            print(f"Error: Directory not found: {args.input}")
+            sys.exit(1)
+        process_all_images(args.input, output_dir)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    print("=== classic_pipeline.py — Synthetic Self-Test ===\n")
+    if len(sys.argv) > 1:
+        main()
+    else:
+        # Synthetic self-test (no CLI args)
+        print("=== classic_pipeline.py — Synthetic Self-Test ===\n")
 
-    # Create a synthetic SEM-like image with dendrite-like structures
-    np.random.seed(42)
-    h, w = 512, 512
-    synth = np.random.randint(30, 80, (h, w), dtype=np.uint8)
+        # Create a synthetic SEM-like image with dendrite-like structures
+        np.random.seed(42)
+        h, w = 512, 512
+        synth = np.random.randint(30, 80, (h, w), dtype=np.uint8)
 
-    # Draw some bright "dendrite" structures
-    cv2.line(synth, (100, 50), (100, 400), 200, 3)
-    cv2.line(synth, (100, 200), (250, 150), 190, 2)
-    cv2.line(synth, (100, 300), (200, 350), 185, 2)
-    cv2.line(synth, (300, 100), (300, 450), 210, 4)
-    cv2.line(synth, (300, 250), (400, 200), 195, 2)
-    cv2.line(synth, (300, 350), (450, 400), 180, 2)
+        # Draw some bright "dendrite" structures
+        cv2.line(synth, (100, 50), (100, 400), 200, 3)
+        cv2.line(synth, (100, 200), (250, 150), 190, 2)
+        cv2.line(synth, (100, 300), (200, 350), 185, 2)
+        cv2.line(synth, (300, 100), (300, 450), 210, 4)
+        cv2.line(synth, (300, 250), (400, 200), 195, 2)
+        cv2.line(synth, (300, 350), (450, 400), 180, 2)
 
-    # Add a bright "scale bar" at bottom
-    synth[460:, :] = 230
+        # Add a bright "scale bar" at bottom
+        synth[460:, :] = 230
 
-    # Save synthetic image, then process it
-    project_dir = os.path.dirname(__file__)
-    test_img_path = os.path.join(project_dir, "output", "synth_dendrites.png")
-    os.makedirs(os.path.dirname(test_img_path), exist_ok=True)
-    cv2.imwrite(test_img_path, synth)
+        # Save synthetic image, then process it
+        project_dir = os.path.dirname(__file__)
+        test_img_path = os.path.join(project_dir, "output", "synth_dendrites.png")
+        os.makedirs(os.path.dirname(test_img_path), exist_ok=True)
+        cv2.imwrite(test_img_path, synth)
 
-    out_dir = os.path.join(project_dir, "output", "classic")
-    results = run_classic_pipeline(test_img_path, out_dir, save_intermediates=True)
+        out_dir = os.path.join(project_dir, "output", "classic")
+        results = run_classic_pipeline(test_img_path, out_dir, save_intermediates=True)
 
-    print(f"\nFinal mask — non-zero pixels: {np.sum(results['mask'] > 0)}")
-    print(f"Skeleton   — non-zero pixels: {np.sum(results['skeleton'] > 0)}")
+        print(f"\nFinal mask — non-zero pixels: {np.sum(results['mask'] > 0)}")
+        print(f"Skeleton   — non-zero pixels: {np.sum(results['skeleton'] > 0)}")
 
-    # Print stage dimensions
-    for name, img in results["intermediates"].items():
-        print(f"  {name}: shape={img.shape}, range=[{img.min()}, {img.max()}]")
+        # Print stage dimensions
+        for name, img in results["intermediates"].items():
+            print(f"  {name}: shape={img.shape}, range=[{img.min()}, {img.max()}]")
 
-    print("\nAll classic pipeline tests passed.")
+        print("\nAll classic pipeline tests passed.")

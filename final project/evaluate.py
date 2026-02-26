@@ -258,6 +258,11 @@ def generate_metrics_summary(results, output_path):
     lines.append("")
     lines.append("=" * 70)
 
+    # Failure analysis
+    failures = analyze_failures(results)
+    failure_report = format_failure_report(failures)
+    lines.append(failure_report)
+
     summary = "\n".join(lines)
     print(summary)
 
@@ -265,6 +270,122 @@ def generate_metrics_summary(results, output_path):
     with open(output_path, 'w') as f:
         f.write(summary)
     print(f"\nSummary saved to: {output_path}")
+
+
+# ===========================================================================
+# Failure analysis
+# ===========================================================================
+
+def analyze_failures(results, threshold=0.5):
+    """
+    Identify and characterize segmentation failures based on metric patterns.
+
+    Root cause characterization rules:
+      - Low precision + high recall  → over-segmentation (noise as dendrite)
+      - High precision + low recall  → under-segmentation (thin branches missed)
+      - Low precision + low recall   → fundamental mismatch (wrong region / artifacts)
+      - Classic fails but YOLO ok    → non-uniform illumination (threshold sensitivity)
+      - YOLO fails but classic ok    → insufficient training data / OOD sample
+
+    Parameters
+    ----------
+    results : dict
+        Mapping of image name to dict with 'classic' and/or 'yolo' metric dicts.
+        Each metric dict has keys: dice, iou, precision, recall.
+    threshold : float
+        Dice score below this value is considered a failure.
+
+    Returns
+    -------
+    failures : list of dict
+        Each entry: {name, method, dice, precision, recall, cause}.
+    """
+    prec_threshold = 0.6
+    rec_threshold = 0.6
+
+    failures = []
+
+    for name in sorted(results.keys()):
+        entry = results[name]
+        classic_dice = entry.get("classic", {}).get("dice")
+        yolo_dice = entry.get("yolo", {}).get("dice")
+
+        for method_key, method_label in [("classic", "Classic"), ("yolo", "YOLO")]:
+            if method_key not in entry:
+                continue
+            m = entry[method_key]
+            if m["dice"] >= threshold:
+                continue
+
+            prec = m["precision"]
+            rec = m["recall"]
+
+            # Determine root cause
+            if prec < prec_threshold and rec >= rec_threshold:
+                cause = "Over-segmentation — noise included as dendrite"
+            elif prec >= prec_threshold and rec < rec_threshold:
+                cause = "Under-segmentation — thin branches missed"
+            elif prec < prec_threshold and rec < rec_threshold:
+                cause = "Fundamental mismatch — wrong region or severe artifacts"
+            else:
+                cause = "Marginal failure — metrics near threshold"
+
+            # Cross-method insight
+            other_key = "yolo" if method_key == "classic" else "classic"
+            other_dice = entry.get(other_key, {}).get("dice")
+            if other_dice is not None and other_dice >= threshold:
+                if method_key == "classic":
+                    cause += " (YOLO succeeds → likely non-uniform illumination)"
+                else:
+                    cause += " (Classic succeeds → likely OOD sample for YOLO)"
+
+            failures.append({
+                "name": name,
+                "method": method_label,
+                "dice": m["dice"],
+                "precision": prec,
+                "recall": rec,
+                "cause": cause,
+            })
+
+    return failures
+
+
+def format_failure_report(failures):
+    """
+    Format a list of failure dicts into a readable text report.
+
+    Parameters
+    ----------
+    failures : list of dict
+        Output from analyze_failures().
+
+    Returns
+    -------
+    report : str
+        Formatted failure analysis text.
+    """
+    lines = []
+    lines.append("")
+    lines.append("=" * 70)
+    lines.append("Failure Analysis (Dice < threshold)")
+    lines.append("=" * 70)
+
+    if not failures:
+        lines.append("  No failures detected — all images above threshold.")
+    else:
+        lines.append(f"  {len(failures)} failure(s) detected:\n")
+        for f in failures:
+            lines.append(f"  Image: {f['name']}")
+            lines.append(f"    Method:    {f['method']}")
+            lines.append(f"    Dice:      {f['dice']:.3f}")
+            lines.append(f"    Precision: {f['precision']:.3f}")
+            lines.append(f"    Recall:    {f['recall']:.3f}")
+            lines.append(f"    Cause:     {f['cause']}")
+            lines.append("")
+
+    lines.append("=" * 70)
+    return "\n".join(lines)
 
 
 # ===========================================================================
@@ -465,5 +586,50 @@ if __name__ == "__main__":
     }
     summary_path = os.path.join(out_dir, "synth_metrics_summary.txt")
     generate_metrics_summary(summary_results, summary_path)
+
+    # --- Test 7: Failure analysis ---
+    print("\nTest 7 — Failure analysis:")
+    failure_results = {
+        "img_good": {
+            "classic": {"dice": 0.85, "iou": 0.74, "precision": 0.90, "recall": 0.81},
+            "yolo": {"dice": 0.91, "iou": 0.84, "precision": 0.93, "recall": 0.89},
+        },
+        "img_over_seg": {
+            "classic": {"dice": 0.35, "iou": 0.21, "precision": 0.30, "recall": 0.80},
+            "yolo": {"dice": 0.88, "iou": 0.79, "precision": 0.91, "recall": 0.86},
+        },
+        "img_under_seg": {
+            "classic": {"dice": 0.40, "iou": 0.25, "precision": 0.85, "recall": 0.30},
+        },
+        "img_mismatch": {
+            "yolo": {"dice": 0.20, "iou": 0.11, "precision": 0.15, "recall": 0.25},
+            "classic": {"dice": 0.75, "iou": 0.60, "precision": 0.80, "recall": 0.70},
+        },
+    }
+
+    failures = analyze_failures(failure_results, threshold=0.5)
+    report = format_failure_report(failures)
+    print(report)
+
+    # Verify expected failures
+    failure_names = [(f["name"], f["method"]) for f in failures]
+    assert ("img_good", "Classic") not in failure_names, "img_good Classic should not fail"
+    assert ("img_good", "YOLO") not in failure_names, "img_good YOLO should not fail"
+    assert ("img_over_seg", "Classic") in failure_names, "img_over_seg Classic should fail"
+    assert ("img_under_seg", "Classic") in failure_names, "img_under_seg Classic should fail"
+    assert ("img_mismatch", "YOLO") in failure_names, "img_mismatch YOLO should fail"
+
+    # Verify root cause patterns
+    over_seg = [f for f in failures if f["name"] == "img_over_seg"][0]
+    assert "Over-segmentation" in over_seg["cause"], \
+        f"Expected over-segmentation cause, got: {over_seg['cause']}"
+    under_seg = [f for f in failures if f["name"] == "img_under_seg"][0]
+    assert "Under-segmentation" in under_seg["cause"], \
+        f"Expected under-segmentation cause, got: {under_seg['cause']}"
+    mismatch = [f for f in failures if f["name"] == "img_mismatch"][0]
+    assert "Fundamental mismatch" in mismatch["cause"], \
+        f"Expected fundamental mismatch cause, got: {mismatch['cause']}"
+
+    print("  All failure analysis assertions passed.")
 
     print("\nAll evaluation tests passed.")

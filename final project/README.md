@@ -20,6 +20,12 @@ Single image:
 python classic_pipeline.py <path/to/image.png>
 ```
 
+Single image with custom output directory and no intermediate stages:
+
+```bash
+python classic_pipeline.py <path/to/image.png> --output results/ --no-intermediates
+```
+
 Batch (all images in a directory):
 
 ```bash
@@ -71,9 +77,44 @@ Batch:
 python yolo_pipeline.py predict --model <weights.pt> --source <images_dir> --output <output_dir>
 ```
 
+## Full Pipeline (run_all.py)
+
+The orchestrator runs both pipelines on the same images and produces all deliverables in one command.
+
+Both pipelines with evaluation:
+
+```bash
+python run_all.py --images data/sem/ --gt data/ground_truth/ --yolo-model weights/best.pt --output output/
+```
+
+Classic pipeline only (no YOLO model):
+
+```bash
+python run_all.py --images data/sem/ --gt data/ground_truth/
+```
+
+Without ground truth (no metrics, just masks and comparison figures):
+
+```bash
+python run_all.py --images data/sem/
+```
+
+Self-test with synthetic images:
+
+```bash
+python run_all.py
+```
+
+The orchestrator runs 5 stages:
+1. Classic pipeline on all images
+2. YOLO pipeline (if model provided)
+3. Skeletonization of classic masks
+4. 4-panel comparison figures (Source, Classic, YOLO, Skeleton)
+5. Evaluation with metrics and failure analysis (if ground truth provided)
+
 ## Evaluation
 
-Computes Dice, IoU, Precision, and Recall against ground truth masks. Generates 4-panel comparison figures (Source, Classic Mask, YOLO Mask, Skeleton) and a text summary.
+Computes Dice, IoU, Precision, and Recall against ground truth masks. Generates 4-panel comparison figures (Source, Classic Mask, YOLO Mask, Skeleton) and a text summary with failure analysis.
 
 ### Batch Evaluation
 
@@ -89,13 +130,24 @@ evaluate_all(
 )
 ```
 
+### Failure Analysis
+
+The evaluation module automatically performs failure analysis on images with Dice score below a configurable threshold (default: 0.5). For each failure, a root cause is characterized based on metric patterns:
+
+- **Over-segmentation** (low precision, high recall) — noise or background included as dendrite
+- **Under-segmentation** (high precision, low recall) — thin branches or low-contrast dendrites missed
+- **Fundamental mismatch** (low precision, low recall) — wrong region detected or severe image artifacts
+- Cross-method insights: if classic fails but YOLO succeeds, the likely cause is non-uniform illumination (classic threshold sensitivity); if YOLO fails but classic succeeds, the sample may be out-of-distribution for the trained model
+
+The failure report is appended to the metrics summary text file.
+
 ### Self-Test
 
 ```bash
 python evaluate.py
 ```
 
-Runs synthetic tests verifying metric correctness (Dice=1.0 for perfect overlap, ~0.67 for half overlap, 0.0 for no overlap) and generates a sample comparison figure.
+Runs synthetic tests verifying metric correctness (Dice=1.0 for perfect overlap, ~0.67 for half overlap, 0.0 for no overlap), generates a sample comparison figure, and validates the failure analysis logic.
 
 ## Output Structure
 
@@ -107,6 +159,8 @@ output/
   yolo/
     train/dendrite_seg/weights/best.pt
     <image_name>_mask.png
+  comparisons/
+    <image_name>_comparison.png
   evaluation/
     <image_name>_comparison.png
     metrics_summary.txt
