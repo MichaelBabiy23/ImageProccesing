@@ -33,16 +33,25 @@ CLAHE_TILE_SIZE = 8
 BILATERAL_D = 9
 BILATERAL_SIGMA_COLOR = 75
 BILATERAL_SIGMA_SPACE = 75
+BILATERAL_PASSES = 2
+
+GAUSSIAN_KSIZE = 5
 
 # Stage B: Segmentation
 ADAPTIVE_BLOCK_SIZE = 51
 ADAPTIVE_C = 5
 
 # Stage C: Post-processing
-EROSION_KERNEL_SIZE = 5
-EROSION_ITERATIONS = 3
+OPENING_KERNEL_SIZE = 3
+EROSION_KERNEL_SIZE = 3
+EROSION_ITERATIONS = 2
 CLOSING_KERNEL_SIZE = 5
 MIN_COMPONENT_AREA = 50
+
+# Substrate suppression (bottom bright electrode region)
+SUBSTRATE_ROW_FG_THRESHOLD = 0.85
+SUBSTRATE_MIN_HEIGHT_FRACTION = 0.06
+SUBSTRATE_MARGIN_ROWS = 2
 
 # Stage D: Separation
 DISTANCE_THRESHOLD = 0.4  # fraction of max distance for watershed markers
@@ -101,7 +110,8 @@ def apply_clahe(image):
 def apply_bilateral_filter(image):
     """
     Edge-preserving denoising via bilateral filtering.
-    Smooths flat regions while preserving sharp dendrite edges.
+    Applies multiple passes to suppress SEM shot noise while preserving
+    sharp dendrite edges.
 
     Parameters
     ----------
@@ -113,9 +123,29 @@ def apply_bilateral_filter(image):
     filtered : np.ndarray
         Denoised image with edges preserved.
     """
-    return cv2.bilateralFilter(
-        image, BILATERAL_D, BILATERAL_SIGMA_COLOR, BILATERAL_SIGMA_SPACE
-    )
+    result = image
+    for _ in range(BILATERAL_PASSES):
+        result = cv2.bilateralFilter(
+            result, BILATERAL_D, BILATERAL_SIGMA_COLOR, BILATERAL_SIGMA_SPACE
+        )
+    return result
+
+
+def apply_gaussian_blur(image):
+    """
+    Moderate Gaussian smoothing to further suppress noise after bilateral.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Grayscale image (H, W), dtype uint8.
+
+    Returns
+    -------
+    blurred : np.ndarray
+        Smoothed image.
+    """
+    return cv2.GaussianBlur(image, (GAUSSIAN_KSIZE, GAUSSIAN_KSIZE), 0)
 
 
 def preprocess(image):
@@ -138,6 +168,7 @@ def preprocess(image):
     normalized = normalize_histogram(cleaned)
     clahe_img = apply_clahe(normalized)
     bilateral_img = apply_bilateral_filter(clahe_img)
+    smoothed = apply_gaussian_blur(bilateral_img)
 
     intermediates = {
         "01_original": image,
@@ -145,8 +176,9 @@ def preprocess(image):
         "03_normalized": normalized,
         "04_clahe": clahe_img,
         "05_bilateral": bilateral_img,
+        "06_smoothed": smoothed,
     }
-    return bilateral_img, intermediates
+    return smoothed, intermediates
 
 
 # ===========================================================================
@@ -195,6 +227,63 @@ def segment_otsu(image):
     """
     _, mask = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask
+
+
+def segment(image):
+    """
+    Segment bright dendrites from dark background.
+    Produces both adaptive and Otsu masks, then selects the better one using
+    simple quality heuristics:
+      - adaptive is chosen only if it has plausible foreground ratio and low
+        small-component noise in the upper image region
+      - otherwise Otsu is used
+    Auto-corrects inverted masks (dendrites should be minority foreground).
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Pre-processed grayscale image (H, W).
+
+    Returns
+    -------
+    mask : np.ndarray
+        Binary mask (0 or 255), dtype uint8.  Dendrites = 255.
+    """
+    def _normalize_polarity(binary_mask):
+        fg_ratio = np.sum(binary_mask > 0) / binary_mask.size
+        if fg_ratio > 0.5:
+            binary_mask = cv2.bitwise_not(binary_mask)
+        return binary_mask
+
+    def _mask_quality(binary_mask):
+        # Evaluate only the upper region where dendrites are expected.
+        top = binary_mask[:max(1, int(binary_mask.shape[0] * 0.8)), :]
+        top_fg_ratio = np.sum(top > 0) / top.size
+
+        # Noise proxy: ratio of tiny connected components to substantial ones.
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(top, connectivity=8)
+        small = 0
+        large = 0
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < 20:
+                small += 1
+            else:
+                large += 1
+        noise_ratio = small / max(1, large)
+        return top_fg_ratio, noise_ratio
+
+    adaptive = _normalize_polarity(segment_adaptive(image))
+    otsu = _normalize_polarity(segment_otsu(image))
+
+    a_fg, a_noise = _mask_quality(adaptive)
+    o_fg, _ = _mask_quality(otsu)
+
+    adaptive_plausible = (0.02 <= a_fg <= 0.55) and (a_noise <= 0.40)
+    if adaptive_plausible and (a_fg >= 0.80 * o_fg or o_fg < 0.08):
+        return adaptive
+
+    return otsu
 
 
 # ===========================================================================
@@ -292,9 +381,85 @@ def remove_small_components(mask, min_area=None):
     return cleaned
 
 
+def remove_substrate_band(mask):
+    """
+    Remove a dense bottom foreground band caused by bright substrate leakage.
+
+    Detects a contiguous trailing run of rows near the image bottom with very
+    high foreground occupancy and zeros it out.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask (0 or 255), dtype uint8.
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Mask with bottom substrate band removed if detected.
+    """
+    binary = mask > 0
+    h = binary.shape[0]
+    row_fg = np.mean(binary, axis=1)
+
+    i = h - 1
+    run = 0
+    while i >= 0 and row_fg[i] >= SUBSTRATE_ROW_FG_THRESHOLD:
+        run += 1
+        i -= 1
+
+    min_rows = max(8, int(h * SUBSTRATE_MIN_HEIGHT_FRACTION))
+    if run < min_rows:
+        return mask
+
+    cutoff = i + 1
+    cutoff = max(0, cutoff - SUBSTRATE_MARGIN_ROWS)
+    cleaned = mask.copy()
+    cleaned[cutoff:, :] = 0
+    return cleaned
+
+
+def remove_bottom_horizontal_artifacts(mask):
+    """
+    Remove thin horizontal artifacts near the bottom that span most of image
+    width (typically residual substrate/interface lines).
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask (0 or 255), dtype uint8.
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Mask with bottom spanning-line artifacts removed.
+    """
+    h, w = mask.shape[:2]
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    cleaned = mask.copy()
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        comp_w = stats[i, cv2.CC_STAT_WIDTH]
+        comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+
+        near_bottom = y >= int(h * 0.5)
+        lower_band = y >= int(h * 0.65)
+        spans_width = (x <= 1) and (x + comp_w >= w - 1)
+        thin_horizontal = comp_h <= 4 and comp_w >= int(w * 0.60)
+        short_flat_stub = comp_h <= 3 and comp_w >= 20
+
+        if near_bottom and (spans_width or thin_horizontal or (lower_band and short_flat_stub)):
+            cleaned[labels == i] = 0
+
+    return cleaned
+
+
 def postprocess(mask):
     """
-    Full post-processing pipeline: reconstruction → closing → small component removal.
+    Full post-processing pipeline:
+    opening → reconstruction → closing → small component removal.
 
     Parameters
     ----------
@@ -308,14 +473,26 @@ def postprocess(mask):
     intermediates : dict
         Dictionary of intermediate masks.
     """
-    recon = morphological_reconstruction(mask)
+    # Kill isolated noise pixels with morphological opening
+    open_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (OPENING_KERNEL_SIZE, OPENING_KERNEL_SIZE)
+    )
+    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+
+    recon = morphological_reconstruction(opened)
     closed = apply_closing(recon)
-    cleaned = remove_small_components(closed)
+
+    # Scale minimum area with image size (at least 0.01% of pixels)
+    min_area = max(MIN_COMPONENT_AREA, int(mask.size * 0.0001))
+    cleaned = remove_small_components(closed, min_area=min_area)
+    cleaned = remove_substrate_band(cleaned)
+    cleaned = remove_bottom_horizontal_artifacts(cleaned)
 
     intermediates = {
-        "07_reconstructed": recon,
-        "08_closed": closed,
-        "09_small_removed": cleaned,
+        "08_opened": opened,
+        "09_reconstructed": recon,
+        "10_closed": closed,
+        "11_small_removed": cleaned,
     }
     return cleaned, intermediates
 
@@ -438,9 +615,9 @@ def run_classic_pipeline(image_path, output_dir=None, save_intermediates=True):
     # Stage A: Pre-processing
     preprocessed, preprocess_ints = preprocess(image)
 
-    # Stage B: Segmentation (adaptive threshold as primary)
-    seg_mask = segment_adaptive(preprocessed)
-    preprocess_ints["06_segmented"] = seg_mask
+    # Stage B: Segmentation (adaptive-first with fallback + auto-inversion)
+    seg_mask = segment(preprocessed)
+    preprocess_ints["07_segmented"] = seg_mask
 
     # Stage C: Post-processing
     clean_mask, postprocess_ints = postprocess(seg_mask)
@@ -455,8 +632,8 @@ def run_classic_pipeline(image_path, output_dir=None, save_intermediates=True):
     all_intermediates = {}
     all_intermediates.update(preprocess_ints)
     all_intermediates.update(postprocess_ints)
-    all_intermediates["10_separated"] = separated
-    all_intermediates["11_skeleton"] = skeleton
+    all_intermediates["12_separated"] = separated
+    all_intermediates["13_skeleton"] = skeleton
 
     # Save results
     if output_dir and save_intermediates:
@@ -567,39 +744,52 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         main()
     else:
-        # Synthetic self-test (no CLI args)
-        print("=== classic_pipeline.py — Synthetic Self-Test ===\n")
+        # No CLI args: try real data directories, fall back to synthetic test
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        easy_dir = os.path.join(project_dir, "data", "raw", "Easy")
+        hard_dir = os.path.join(project_dir, "data", "raw", "Hard")
+        output_dir = os.path.join(project_dir, "output", "classic")
 
-        # Create a synthetic SEM-like image with dendrite-like structures
-        np.random.seed(42)
-        h, w = 512, 512
-        synth = np.random.randint(30, 80, (h, w), dtype=np.uint8)
+        if os.path.isdir(easy_dir) or os.path.isdir(hard_dir):
+            print("=== classic_pipeline.py — Processing Real Data ===\n")
+            for d in [easy_dir, hard_dir]:
+                if os.path.isdir(d):
+                    category = os.path.basename(d)
+                    cat_output = os.path.join(output_dir, category)
+                    print(f"--- {category} ---")
+                    process_all_images(d, cat_output)
+                    print()
+        else:
+            # Synthetic self-test
+            print("=== classic_pipeline.py — Synthetic Self-Test ===\n")
 
-        # Draw some bright "dendrite" structures
-        cv2.line(synth, (100, 50), (100, 400), 200, 3)
-        cv2.line(synth, (100, 200), (250, 150), 190, 2)
-        cv2.line(synth, (100, 300), (200, 350), 185, 2)
-        cv2.line(synth, (300, 100), (300, 450), 210, 4)
-        cv2.line(synth, (300, 250), (400, 200), 195, 2)
-        cv2.line(synth, (300, 350), (450, 400), 180, 2)
+            np.random.seed(42)
+            h, w = 512, 512
+            synth = np.random.randint(30, 80, (h, w), dtype=np.uint8)
 
-        # Add a bright "scale bar" at bottom
-        synth[460:, :] = 230
+            # Draw some bright "dendrite" structures
+            cv2.line(synth, (100, 50), (100, 400), 200, 3)
+            cv2.line(synth, (100, 200), (250, 150), 190, 2)
+            cv2.line(synth, (100, 300), (200, 350), 185, 2)
+            cv2.line(synth, (300, 100), (300, 450), 210, 4)
+            cv2.line(synth, (300, 250), (400, 200), 195, 2)
+            cv2.line(synth, (300, 350), (450, 400), 180, 2)
 
-        # Save synthetic image, then process it
-        project_dir = os.path.dirname(__file__)
-        test_img_path = os.path.join(project_dir, "output", "synth_dendrites.png")
-        os.makedirs(os.path.dirname(test_img_path), exist_ok=True)
-        cv2.imwrite(test_img_path, synth)
+            # Add a bright "scale bar" at bottom
+            synth[460:, :] = 230
 
-        out_dir = os.path.join(project_dir, "output", "classic")
-        results = run_classic_pipeline(test_img_path, out_dir, save_intermediates=True)
+            # Save synthetic image, then process it
+            test_img_path = os.path.join(project_dir, "output", "synth_dendrites.png")
+            os.makedirs(os.path.dirname(test_img_path), exist_ok=True)
+            cv2.imwrite(test_img_path, synth)
 
-        print(f"\nFinal mask — non-zero pixels: {np.sum(results['mask'] > 0)}")
-        print(f"Skeleton   — non-zero pixels: {np.sum(results['skeleton'] > 0)}")
+            out_dir = os.path.join(project_dir, "output", "classic")
+            results = run_classic_pipeline(test_img_path, out_dir, save_intermediates=True)
 
-        # Print stage dimensions
-        for name, img in results["intermediates"].items():
-            print(f"  {name}: shape={img.shape}, range=[{img.min()}, {img.max()}]")
+            print(f"\nFinal mask — non-zero pixels: {np.sum(results['mask'] > 0)}")
+            print(f"Skeleton   — non-zero pixels: {np.sum(results['skeleton'] > 0)}")
 
-        print("\nAll classic pipeline tests passed.")
+            for name, img in results["intermediates"].items():
+                print(f"  {name}: shape={img.shape}, range=[{img.min()}, {img.max()}]")
+
+            print("\nAll classic pipeline tests passed.")

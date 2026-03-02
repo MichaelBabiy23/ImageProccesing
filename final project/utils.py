@@ -16,24 +16,39 @@ SCALE_BAR_FRACTION = 0.12
 
 def load_image(path, grayscale=True):
     """
-    Load an image from disk.
+    Load an image from disk.  Handles 16-bit TIF files by normalizing
+    to uint8 with full dynamic-range preservation.
 
     Parameters
     ----------
     path : str
         Path to the image file.
     grayscale : bool
-        If True, load as single-channel grayscale.
+        If True, return as single-channel grayscale.
 
     Returns
     -------
     image : np.ndarray
         Loaded image (H, W) if grayscale, (H, W, 3) if color.
     """
-    flag = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
-    image = cv2.imread(path, flag)
+    # Load unchanged to preserve 16-bit depth
+    image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if image is None:
         raise FileNotFoundError(f"Could not load image: {path}")
+
+    # Handle 16-bit images: normalize full dynamic range to 0-255
+    if image.dtype == np.uint16:
+        # Convert to grayscale first if multi-channel 16-bit
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Convert between grayscale and color as requested
+    if grayscale and image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    elif not grayscale and image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
     return image
 
 
