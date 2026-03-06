@@ -4,10 +4,19 @@ Classic CV pipeline for SEM dendrite segmentation.
 Four-stage pipeline:
   A. Pre-processing  — histogram normalization, CLAHE, bilateral filter
   B. Segmentation    — adaptive thresholding (primary), Otsu (fallback)
-  C. Post-processing — morphological reconstruction, closing, small component removal
+  C. Post-processing — morphological reconstruction, closing,
+                       small component removal, substrate band removal
+                       (two-stage: smoothed FG + intensity profile),
+                       top band removal, edge noise removal,
+                       horizontal artifact removal
   D. Separation      — distance transform + watershed for touching branches
 
-Plus skeletonization via Zhang-Suen thinning.
+Plus skeletonization via Zhang-Suen thinning with pruning and spur removal.
+
+Usage:
+  python classic_pipeline.py image.tif              # single image
+  python classic_pipeline.py --input data/raw/Easy  # batch directory
+  python classic_pipeline.py                        # synthetic self-test or real data
 """
 
 import argparse
@@ -48,13 +57,30 @@ EROSION_ITERATIONS = 2
 CLOSING_KERNEL_SIZE = 5
 MIN_COMPONENT_AREA = 50
 
-# Substrate suppression (bottom bright electrode region)
-SUBSTRATE_ROW_FG_THRESHOLD = 0.85
-SUBSTRATE_MIN_HEIGHT_FRACTION = 0.06
-SUBSTRATE_MARGIN_ROWS = 2
+# Substrate suppression (bottom bright electrode region — "ground of the trees")
+SUBSTRATE_ROW_FG_THRESHOLD = 0.50       # smoothed row-FG threshold for Stage 1
+SUBSTRATE_MIN_HEIGHT_FRACTION = 0.06    # minimum substrate band height as fraction of image
+SUBSTRATE_MARGIN_ROWS = 2              # extra rows to remove above detected cutoff
+SUBSTRATE_FG_WINDOW = 20               # moving-average window (rows) for FG smoothing
+SUBSTRATE_INTENSITY_JUMP_RATIO = 0.25  # min contrast ratio (bottom vs top) for Stage 2
+SUBSTRATE_INTENSITY_SMOOTH_K = 41      # kernel size for row-mean intensity smoothing
+SUBSTRATE_INTENSITY_MIN_RUN = 50       # min contiguous bright rows for intensity detection
+
+# Top-band suppression (bright header / nanopore pattern at image top)
+TOP_BAND_FG_THRESHOLD = 0.30           # row-FG threshold for top-band detection
+TOP_BAND_MIN_ROWS = 20                 # minimum run of dense rows to trigger removal
+TOP_BAND_MAX_FRACTION = 0.15           # cap: never remove more than 15% of image height
+
+# Edge noise removal (small components hugging left/right margins)
+EDGE_MARGIN_FRACTION = 0.05            # fraction of width defining edge zone
+EDGE_COMPONENT_MAX_AREA = 2000         # max area for a component to be considered edge noise
 
 # Stage D: Separation
 DISTANCE_THRESHOLD = 0.4  # fraction of max distance for watershed markers
+
+# Skeleton pruning
+SKELETON_MIN_BRANCH_LENGTH = 15
+SKELETON_SPUR_LENGTH = 10
 
 
 # ===========================================================================
@@ -250,17 +276,19 @@ def segment(image):
         Binary mask (0 or 255), dtype uint8.  Dendrites = 255.
     """
     def _normalize_polarity(binary_mask):
+        """Ensure dendrites are foreground (minority). Invert if FG > 50%."""
         fg_ratio = np.sum(binary_mask > 0) / binary_mask.size
         if fg_ratio > 0.5:
             binary_mask = cv2.bitwise_not(binary_mask)
         return binary_mask
 
     def _mask_quality(binary_mask):
-        # Evaluate only the upper region where dendrites are expected.
+        """Compute FG ratio and noise ratio in the upper 80% of the image."""
+        # Evaluate only the upper region where dendrites are expected
         top = binary_mask[:max(1, int(binary_mask.shape[0] * 0.8)), :]
         top_fg_ratio = np.sum(top > 0) / top.size
 
-        # Noise proxy: ratio of tiny connected components to substantial ones.
+        # Noise proxy: ratio of tiny (<20px) components to substantial ones
         num_labels, _, stats, _ = cv2.connectedComponentsWithStats(top, connectivity=8)
         small = 0
         large = 0
@@ -273,12 +301,16 @@ def segment(image):
         noise_ratio = small / max(1, large)
         return top_fg_ratio, noise_ratio
 
+    # Generate both masks and normalize polarity (dendrites = white)
     adaptive = _normalize_polarity(segment_adaptive(image))
     otsu = _normalize_polarity(segment_otsu(image))
 
+    # Evaluate quality of each mask
     a_fg, a_noise = _mask_quality(adaptive)
     o_fg, _ = _mask_quality(otsu)
 
+    # Prefer adaptive if it has plausible FG ratio and low noise;
+    # fall back to Otsu otherwise (better for uniform illumination)
     adaptive_plausible = (0.02 <= a_fg <= 0.55) and (a_noise <= 0.40)
     if adaptive_plausible and (a_fg >= 0.80 * o_fg or o_fg < 0.08):
         return adaptive
@@ -381,12 +413,132 @@ def remove_small_components(mask, min_area=None):
     return cleaned
 
 
-def remove_substrate_band(mask):
+def remove_substrate_band(mask, preprocessed=None):
     """
-    Remove a dense bottom foreground band caused by bright substrate leakage.
+    Remove the bright substrate/electrode base ("ground of the trees") where
+    dendrites grow from.  Uses a two-stage approach to handle both dense
+    (Easy images) and grain-boundary (Hard Group B) substrate regions.
 
-    Detects a contiguous trailing run of rows near the image bottom with very
-    high foreground occupancy and zeros it out.
+    Stage 1 — Smoothed foreground scan:
+        Smooth per-row FG ratio with a moving average, then scan from the
+        bottom upward looking for a contiguous run of rows whose smoothed
+        FG >= SUBSTRATE_ROW_FG_THRESHOLD (0.50).  The moving average lets us
+        catch grain-boundary regions where raw per-row FG oscillates 30-70%.
+
+    Stage 2 — Intensity-profile detection (only if Stage 1 found nothing):
+        If a preprocessed image is provided, compute the row-mean intensity
+        profile and look for a bright substrate region at the bottom whose
+        average intensity is significantly higher than the dark upper region.
+        The transition row where brightness rises is used as the cutoff.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask (0 or 255), dtype uint8.
+    preprocessed : np.ndarray or None
+        Pre-processed grayscale image (H, W), used for Stage 2 intensity
+        analysis.  If None, only Stage 1 is applied (backward compatible).
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Mask with bottom substrate band removed if detected.
+    """
+    binary = mask > 0
+    h, w = binary.shape
+    row_fg = np.mean(binary, axis=1)  # per-row foreground ratio [0, 1]
+
+    # --- Stage 1: Smoothed FG scan from bottom ---
+    # Apply moving average to smooth out oscillations in grain boundaries
+    win = SUBSTRATE_FG_WINDOW
+    if h >= win:
+        kernel = np.ones(win) / win
+        smoothed_fg = np.convolve(row_fg, kernel, mode='same')
+    else:
+        smoothed_fg = row_fg
+
+    # Scan from bottom: find contiguous run where smoothed FG >= threshold
+    i = h - 1
+    run = 0
+    while i >= 0 and smoothed_fg[i] >= SUBSTRATE_ROW_FG_THRESHOLD:
+        run += 1
+        i -= 1
+
+    min_rows = max(8, int(h * SUBSTRATE_MIN_HEIGHT_FRACTION))
+
+    if run >= min_rows:
+        # Stage 1 found substrate — zero everything below cutoff
+        cutoff = (i + 1) - SUBSTRATE_MARGIN_ROWS
+        cutoff = max(0, cutoff)
+        cleaned = mask.copy()
+        cleaned[cutoff:, :] = 0
+        return cleaned
+
+    # --- Stage 2: Intensity-profile detection (needs preprocessed image) ---
+    if preprocessed is None:
+        return mask  # no preprocessed image, nothing more we can do
+
+    # Compute row-mean intensity and smooth it
+    row_intensity = np.mean(preprocessed.astype(np.float64), axis=1)
+    k = min(SUBSTRATE_INTENSITY_SMOOTH_K, h)
+    if k % 2 == 0:
+        k = max(1, k - 1)  # ensure odd kernel size
+    smooth_kernel = np.ones(k) / k
+    smoothed_intensity = np.convolve(row_intensity, smooth_kernel, mode='same')
+
+    # Compare top 20% (dark dendrite region) vs bottom 60-88% (potential substrate)
+    top_end = int(h * 0.20)
+    bot_start = int(h * 0.60)
+    bot_end = int(h * 0.88)
+
+    if top_end < 1 or bot_start >= bot_end:
+        return mask  # image too small for meaningful analysis
+
+    top_median = np.median(smoothed_intensity[:top_end])
+    bot_median = np.median(smoothed_intensity[bot_start:bot_end])
+
+    # Check if bottom is significantly brighter than top
+    if top_median <= 0 or (bot_median - top_median) / max(1.0, bot_median) < SUBSTRATE_INTENSITY_JUMP_RATIO:
+        return mask  # not enough contrast — no clear substrate
+
+    # Find transition row: scan upward from bottom, find where intensity
+    # drops below the dark region's baseline + a margin
+    threshold_intensity = top_median + 0.35 * (bot_median - top_median)
+    transition = h - 1
+    run_count = 0
+    for r in range(h - 1, -1, -1):
+        if smoothed_intensity[r] >= threshold_intensity:
+            run_count += 1
+        else:
+            if run_count >= SUBSTRATE_INTENSITY_MIN_RUN:
+                transition = r + 1
+                break
+            run_count = 0
+    else:
+        # Scanned all the way to top without breaking
+        if run_count >= SUBSTRATE_INTENSITY_MIN_RUN:
+            transition = 0
+
+    if transition >= h - min_rows:
+        return mask  # transition too close to bottom, not meaningful
+
+    cutoff = max(0, transition - SUBSTRATE_MARGIN_ROWS)
+    cleaned = mask.copy()
+    cleaned[cutoff:, :] = 0
+    return cleaned
+
+
+def remove_top_band(mask):
+    """
+    Remove a dense foreground band at the top of the image.
+
+    Some Hard images (e.g., 70nm_pitch_035) have a bright nanopore/nanowire
+    pattern in the top rows that gets falsely segmented.  This function scans
+    from row 0 downward, finds a contiguous run of rows with high FG ratio,
+    and zeros them out.
+
+    Safety cap: never removes more than TOP_BAND_MAX_FRACTION (15%) of image
+    height to avoid accidentally deleting real dendrites.
 
     Parameters
     ----------
@@ -396,26 +548,71 @@ def remove_substrate_band(mask):
     Returns
     -------
     cleaned : np.ndarray
-        Mask with bottom substrate band removed if detected.
+        Mask with top band removed if detected.
     """
     binary = mask > 0
     h = binary.shape[0]
     row_fg = np.mean(binary, axis=1)
 
-    i = h - 1
+    # Scan from top: find contiguous run where FG >= threshold
     run = 0
-    while i >= 0 and row_fg[i] >= SUBSTRATE_ROW_FG_THRESHOLD:
-        run += 1
-        i -= 1
+    for i in range(h):
+        if row_fg[i] >= TOP_BAND_FG_THRESHOLD:
+            run += 1
+        else:
+            break  # first gap ends the run
 
-    min_rows = max(8, int(h * SUBSTRATE_MIN_HEIGHT_FRACTION))
-    if run < min_rows:
-        return mask
+    if run < TOP_BAND_MIN_ROWS:
+        return mask  # no significant top band found
 
-    cutoff = i + 1
-    cutoff = max(0, cutoff - SUBSTRATE_MARGIN_ROWS)
+    # Cap removal at a fraction of image height to prevent over-removal
+    max_remove = int(h * TOP_BAND_MAX_FRACTION)
+    cutoff = min(run, max_remove)
+
     cleaned = mask.copy()
-    cleaned[cutoff:, :] = 0
+    cleaned[:cutoff, :] = 0
+    return cleaned
+
+
+def remove_edge_noise(mask):
+    """
+    Remove small connected components whose centroids hug the left or right
+    image margins.
+
+    SEM images sometimes have noise or annotation artifacts near the edges.
+    Any component with centroid within EDGE_MARGIN_FRACTION of either side
+    AND area below EDGE_COMPONENT_MAX_AREA is removed.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask (0 or 255), dtype uint8.
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Mask with edge-hugging small components removed.
+    """
+    h, w = mask.shape[:2]
+    margin = int(w * EDGE_MARGIN_FRACTION)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+    cleaned = mask.copy()
+
+    for i in range(1, num_labels):
+        cx = centroids[i, 0]  # x-coordinate of centroid
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        # Check if centroid is within edge margin and component is small
+        near_left = cx < margin
+        near_right = cx > (w - margin)
+        small_enough = area < EDGE_COMPONENT_MAX_AREA
+
+        if (near_left or near_right) and small_enough:
+            cleaned[labels == i] = 0
+
     return cleaned
 
 
@@ -423,6 +620,13 @@ def remove_bottom_horizontal_artifacts(mask):
     """
     Remove thin horizontal artifacts near the bottom that span most of image
     width (typically residual substrate/interface lines).
+
+    Targets three patterns:
+      - Components that span the full image width (edge-to-edge)
+      - Thin horizontal strips (height <= 4, width >= 60% of image)
+      - Short flat stubs in the lower 35% (height <= 3, width >= 20)
+
+    All must originate in the bottom half of the image.
 
     Parameters
     ----------
@@ -444,9 +648,10 @@ def remove_bottom_horizontal_artifacts(mask):
         comp_w = stats[i, cv2.CC_STAT_WIDTH]
         comp_h = stats[i, cv2.CC_STAT_HEIGHT]
 
-        near_bottom = y >= int(h * 0.5)
-        lower_band = y >= int(h * 0.65)
-        spans_width = (x <= 1) and (x + comp_w >= w - 1)
+        # Geometric tests for horizontal line-like components
+        near_bottom = y >= int(h * 0.5)          # bottom half of image
+        lower_band = y >= int(h * 0.65)           # bottom 35%
+        spans_width = (x <= 1) and (x + comp_w >= w - 1)  # edge to edge
         thin_horizontal = comp_h <= 4 and comp_w >= int(w * 0.60)
         short_flat_stub = comp_h <= 3 and comp_w >= 20
 
@@ -456,22 +661,32 @@ def remove_bottom_horizontal_artifacts(mask):
     return cleaned
 
 
-def postprocess(mask):
+def postprocess(mask, preprocessed=None):
     """
     Full post-processing pipeline:
-    opening → reconstruction → closing → small component removal.
+    opening → reconstruction → closing → component cleanup → band removal.
+
+    The cleanup chain after closing is:
+      1. remove_small_components  — delete tiny noise blobs
+      2. remove_substrate_band    — delete bright substrate at bottom (2-stage)
+      3. remove_top_band          — delete dense pattern band at top
+      4. remove_edge_noise        — delete small edge-hugging components
+      5. remove_bottom_horizontal_artifacts — delete residual horizontal lines
 
     Parameters
     ----------
     mask : np.ndarray
-        Raw binary segmentation mask.
+        Raw binary segmentation mask (0 or 255).
+    preprocessed : np.ndarray or None
+        Pre-processed grayscale image, passed to remove_substrate_band()
+        for intensity-based substrate detection (Stage 2).
 
     Returns
     -------
     result : np.ndarray
         Cleaned binary mask.
     intermediates : dict
-        Dictionary of intermediate masks.
+        Dictionary of intermediate masks for visualization.
     """
     # Kill isolated noise pixels with morphological opening
     open_kernel = cv2.getStructuringElement(
@@ -485,7 +700,9 @@ def postprocess(mask):
     # Scale minimum area with image size (at least 0.01% of pixels)
     min_area = max(MIN_COMPONENT_AREA, int(mask.size * 0.0001))
     cleaned = remove_small_components(closed, min_area=min_area)
-    cleaned = remove_substrate_band(cleaned)
+    cleaned = remove_substrate_band(cleaned, preprocessed)
+    cleaned = remove_top_band(cleaned)
+    cleaned = remove_edge_noise(cleaned)
     cleaned = remove_bottom_horizontal_artifacts(cleaned)
 
     intermediates = {
@@ -576,9 +793,137 @@ def skeletonize_mask(mask):
     skeleton : np.ndarray
         Skeleton image (0 or 255), dtype uint8.
     """
-    binary = (mask > 0).astype(bool)
+    # Smooth jagged mask edges with a small closing to prevent diamond/loop
+    # artifacts in the skeleton.  Closing only adds pixels (fills 1px notches)
+    # so it does not alter branch topology.
+    smooth_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    smoothed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, smooth_kernel)
+    binary = (smoothed > 0).astype(bool)
     skel = skeletonize(binary)
-    return (skel.astype(np.uint8) * 255)
+    skeleton = skel.astype(np.uint8) * 255
+    skeleton = prune_skeleton(skeleton)
+    skeleton = remove_spurs(skeleton)
+    return skeleton
+
+
+def prune_skeleton(skeleton):
+    """
+    Remove skeleton artifacts: tiny fragments and horizontal line remnants.
+
+    Removes connected components that are either:
+      - Smaller than SKELETON_MIN_BRANCH_LENGTH pixels (tiny stubs), or
+      - Horizontal lines (height <= 3 and width >= 20).
+
+    Parameters
+    ----------
+    skeleton : np.ndarray
+        Skeleton image (0 or 255), dtype uint8.
+
+    Returns
+    -------
+    pruned : np.ndarray
+        Cleaned skeleton image (0 or 255), dtype uint8.
+    """
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        skeleton, connectivity=8
+    )
+    pruned = skeleton.copy()
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        is_small = area < SKELETON_MIN_BRANCH_LENGTH
+        is_horizontal_line = h <= 3 and w >= 20
+        if is_small or is_horizontal_line:
+            pruned[labels == i] = 0
+    return pruned
+
+
+def remove_spurs(skeleton):
+    """
+    Iteratively remove short terminal branches (spurs) from a skeleton.
+
+    A spur is a path from an endpoint (1 neighbor) to the nearest junction
+    (3+ neighbors).  If that path is <= SKELETON_SPUR_LENGTH pixels the spur
+    is erased (the junction pixel itself is kept).
+
+    Iteration is needed because removing a spur may turn a former junction
+    into a new endpoint, revealing another spur.
+
+    Parameters
+    ----------
+    skeleton : np.ndarray
+        Skeleton image (0 or 255), dtype uint8.
+
+    Returns
+    -------
+    cleaned : np.ndarray
+        Skeleton with short spurs removed, same dtype.
+    """
+    skel = skeleton.copy()
+    neighbor_kernel = np.array([[1, 1, 1],
+                                [1, 0, 1],
+                                [1, 1, 1]], dtype=np.uint8)
+
+    while True:
+        binary = (skel > 0).astype(np.uint8)
+        neighbor_count = cv2.filter2D(binary, cv2.CV_16S, neighbor_kernel)
+        neighbor_count = neighbor_count.astype(np.int16)
+
+        # Endpoints: skeleton pixel with exactly 1 neighbor
+        endpoints = (binary == 1) & (neighbor_count == 1)
+        ep_coords = list(zip(*np.where(endpoints)))
+        if not ep_coords:
+            break
+
+        removed_any = False
+        for r, c in ep_coords:
+            if skel[r, c] == 0:
+                continue  # already removed in this pass
+
+            # Trace from endpoint toward junction
+            path = [(r, c)]
+            cr, cc = r, c
+            visited = {(cr, cc)}
+
+            while True:
+                # Look at 8-connected neighbors
+                found_next = False
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        nr, nc = cr + dr, cc + dc
+                        if (nr, nc) in visited:
+                            continue
+                        if 0 <= nr < skel.shape[0] and 0 <= nc < skel.shape[1] and skel[nr, nc] > 0:
+                            nb = int(neighbor_count[nr, nc])
+                            if nb >= 3:
+                                # Reached a junction — stop (don't include it)
+                                found_next = False
+                                break
+                            # Regular continuation pixel
+                            path.append((nr, nc))
+                            visited.add((nr, nc))
+                            cr, cc = nr, nc
+                            found_next = True
+                            break
+                    else:
+                        continue
+                    break
+
+                if not found_next:
+                    break
+
+            if len(path) <= SKELETON_SPUR_LENGTH:
+                for pr, pc in path:
+                    skel[pr, pc] = 0
+                removed_any = True
+
+        if not removed_any:
+            break
+
+    return skel
 
 
 # ===========================================================================
@@ -619,8 +964,8 @@ def run_classic_pipeline(image_path, output_dir=None, save_intermediates=True):
     seg_mask = segment(preprocessed)
     preprocess_ints["07_segmented"] = seg_mask
 
-    # Stage C: Post-processing
-    clean_mask, postprocess_ints = postprocess(seg_mask)
+    # Stage C: Post-processing (pass preprocessed for intensity-based substrate detection)
+    clean_mask, postprocess_ints = postprocess(seg_mask, preprocessed)
 
     # Stage D: Separation
     separated = separate_branches(clean_mask)
