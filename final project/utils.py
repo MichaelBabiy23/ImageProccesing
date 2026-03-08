@@ -11,7 +11,7 @@ import os
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')
 
 # Scale bar region — bottom fraction of SEM image containing instrument metadata
-SCALE_BAR_FRACTION = 0.12
+SCALE_BAR_FRACTION = 0.064
 
 
 def load_image(path, grayscale=True):

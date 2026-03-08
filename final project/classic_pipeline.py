@@ -36,26 +36,33 @@ from utils import load_image, save_image, list_images, clean_sem_image
 # ---------------------------------------------------------------------------
 
 # Stage A: Pre-processing
-CLAHE_CLIP_LIMIT = 3.0
+CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_SIZE = 8
 
 BILATERAL_D = 9
-BILATERAL_SIGMA_COLOR = 75
-BILATERAL_SIGMA_SPACE = 75
-BILATERAL_PASSES = 2
+BILATERAL_SIGMA_COLOR = 50
+BILATERAL_SIGMA_SPACE = 50
+BILATERAL_PASSES = 1
 
-GAUSSIAN_KSIZE = 5
+GAUSSIAN_KSIZE = 1
 
 # Stage B: Segmentation
-ADAPTIVE_BLOCK_SIZE = 51
-ADAPTIVE_C = 5
+ADAPTIVE_BLOCK_SIZE = 67
+ADAPTIVE_C = -12
 
 # Stage C: Post-processing
-OPENING_KERNEL_SIZE = 3
+OPENING_KERNEL_SIZE = 1
 EROSION_KERNEL_SIZE = 3
-EROSION_ITERATIONS = 2
-CLOSING_KERNEL_SIZE = 5
-MIN_COMPONENT_AREA = 50
+EROSION_ITERATIONS = 1
+CLOSING_KERNEL_SIZE = 3
+MIN_COMPONENT_AREA = 150
+MIN_COMPONENT_AREA_FRACTION = 0.00005
+MIN_COMPONENT_AREA_MAX = 320
+NOISE_COMPONENT_COUNT_THRESHOLD = 25000
+RECON_MIN_KEEP_RATIO = 0.72
+BASELINE_DETECT_MIN_ROW_RATIO = 0.80
+BASELINE_DETECT_SEARCH_START_RATIO = 0.60
+SMALL_TREE_BAND_HEIGHT = 30
 
 # Substrate suppression (bottom bright electrode region — "ground of the trees")
 SUBSTRATE_ROW_FG_THRESHOLD = 0.50       # smoothed row-FG threshold for Stage 1
@@ -76,11 +83,12 @@ EDGE_MARGIN_FRACTION = 0.05            # fraction of width defining edge zone
 EDGE_COMPONENT_MAX_AREA = 2000         # max area for a component to be considered edge noise
 
 # Stage D: Separation
-DISTANCE_THRESHOLD = 0.4  # fraction of max distance for watershed markers
+DISTANCE_THRESHOLD = 0.35  # fraction of max distance for watershed markers
 
 # Skeleton pruning
-SKELETON_MIN_BRANCH_LENGTH = 15
-SKELETON_SPUR_LENGTH = 10
+SKELETON_MIN_BRANCH_LENGTH = 8
+SKELETON_SPUR_LENGTH = 6
+SKELETON_HORIZONTAL_LINE_MIN_WIDTH = 40
 
 
 # ===========================================================================
@@ -309,10 +317,10 @@ def segment(image):
     a_fg, a_noise = _mask_quality(adaptive)
     o_fg, _ = _mask_quality(otsu)
 
-    # Prefer adaptive if it has plausible FG ratio and low noise;
-    # fall back to Otsu otherwise (better for uniform illumination)
-    adaptive_plausible = (0.02 <= a_fg <= 0.55) and (a_noise <= 0.40)
-    if adaptive_plausible and (a_fg >= 0.80 * o_fg or o_fg < 0.08):
+    # Prefer adaptive whenever FG ratio is plausible for SEM dendrites.
+    # Tiny-component specks are handled in post-processing.
+    adaptive_plausible = 0.01 <= a_fg <= 0.55
+    if adaptive_plausible:
         return adaptive
 
     return otsu
@@ -382,7 +390,7 @@ def apply_closing(mask):
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
-def remove_small_components(mask, min_area=None):
+def remove_small_components(mask, min_area=None, baseline_row=None):
     """
     Remove connected components smaller than min_area pixels.
     Based on the physical assumption that dendrites are large,
@@ -394,6 +402,9 @@ def remove_small_components(mask, min_area=None):
         Binary mask (0 or 255), dtype uint8.
     min_area : int or None
         Minimum component area in pixels. Uses MIN_COMPONENT_AREA if None.
+    baseline_row : int or None
+        Optional baseline row. Components whose bottom lies in a small band
+        above this row are preserved even if they are below min_area.
 
     Returns
     -------
@@ -407,10 +418,73 @@ def remove_small_components(mask, min_area=None):
         mask, connectivity=8
     )
     cleaned = np.zeros_like(mask)
+    band_top = None
+    if baseline_row is not None:
+        band_top = max(0, int(baseline_row) - SMALL_TREE_BAND_HEIGHT)
+
     for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        top = int(stats[i, cv2.CC_STAT_TOP])
+        height = int(stats[i, cv2.CC_STAT_HEIGHT])
+        bottom = top + height - 1
+
+        # Preserve small tree stumps right above the substrate baseline.
+        if band_top is not None and band_top <= bottom <= int(baseline_row):
+            cleaned[labels == i] = 255
+            continue
+
+        if area >= min_area:
             cleaned[labels == i] = 255
     return cleaned
+
+
+def choose_min_component_area(mask):
+    """
+    Choose an adaptive small-component threshold for the current image/mask.
+
+    The goal is to avoid removing thin dendrite fragments on sparse images
+    while still suppressing heavy speckle noise on high-resolution/noisy images.
+    """
+    base = max(MIN_COMPONENT_AREA, int(mask.size * MIN_COMPONENT_AREA_FRACTION))
+    fg_ratio = np.count_nonzero(mask) / float(mask.size)
+
+    num_labels, _, _, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    component_count = max(0, num_labels - 1)
+
+    # Dense masks and huge component counts indicate noisy images.
+    if fg_ratio > 0.25:
+        base = max(base, int(MIN_COMPONENT_AREA * 1.5))
+    if component_count > NOISE_COMPONENT_COUNT_THRESHOLD:
+        base = max(base, int(MIN_COMPONENT_AREA * 1.4))
+
+    return int(min(base, MIN_COMPONENT_AREA_MAX))
+
+
+def detect_baseline_row(mask):
+    """
+    Detect a baseline row where the bottom substrate region starts.
+    """
+    if mask is None or mask.ndim != 2 or mask.size == 0:
+        return None
+
+    h = mask.shape[0]
+    y_start = min(h - 1, int(round(h * BASELINE_DETECT_SEARCH_START_RATIO)))
+    row_ratio = np.mean(mask > 0, axis=1)
+    idx = np.flatnonzero(row_ratio[y_start:] >= BASELINE_DETECT_MIN_ROW_RATIO)
+    if idx.size == 0:
+        return None
+    return y_start + int(idx[0])
+
+
+def zero_below_baseline(mask, baseline_row):
+    """
+    Zero baseline row and everything below it.
+    """
+    if baseline_row is None:
+        return mask
+    out = mask.copy()
+    out[int(baseline_row):, :] = 0
+    return out
 
 
 def remove_substrate_band(mask, preprocessed=None):
@@ -667,11 +741,9 @@ def postprocess(mask, preprocessed=None):
     opening → reconstruction → closing → component cleanup → band removal.
 
     The cleanup chain after closing is:
-      1. remove_small_components  — delete tiny noise blobs
-      2. remove_substrate_band    — delete bright substrate at bottom (2-stage)
-      3. remove_top_band          — delete dense pattern band at top
-      4. remove_edge_noise        — delete small edge-hugging components
-      5. remove_bottom_horizontal_artifacts — delete residual horizontal lines
+      1. detect baseline + cut below it
+      2. remove substrate/top/edge/horizontal artifacts
+      3. remove_small_components (with baseline-band preservation)
 
     Parameters
     ----------
@@ -695,15 +767,35 @@ def postprocess(mask, preprocessed=None):
     opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
 
     recon = morphological_reconstruction(opened)
+    pre_recon_area = int(np.count_nonzero(opened))
+    recon_area = int(np.count_nonzero(recon))
+    keep_ratio = (recon_area / float(pre_recon_area)) if pre_recon_area > 0 else 1.0
+    if keep_ratio < RECON_MIN_KEEP_RATIO:
+        # Reconstruction can erase thin trees on sparse images.
+        # If too much is lost, keep the pre-reconstruction mask.
+        recon = opened.copy()
+        print(
+            f"  Reconstruction fallback: keep={keep_ratio:.1%} < "
+            f"{RECON_MIN_KEEP_RATIO:.0%}; using pre-reconstruction mask."
+        )
+
     closed = apply_closing(recon)
 
-    # Scale minimum area with image size (at least 0.01% of pixels)
-    min_area = max(MIN_COMPONENT_AREA, int(mask.size * 0.0001))
-    cleaned = remove_small_components(closed, min_area=min_area)
+    # Remove known geometric artifacts before size filtering.
+    baseline_row = detect_baseline_row(closed)
+    cleaned = zero_below_baseline(closed, baseline_row)
     cleaned = remove_substrate_band(cleaned, preprocessed)
     cleaned = remove_top_band(cleaned)
     cleaned = remove_edge_noise(cleaned)
     cleaned = remove_bottom_horizontal_artifacts(cleaned)
+
+    # Adaptive small-component filtering to preserve sparse dendrite tips.
+    min_area = choose_min_component_area(cleaned)
+    cleaned = remove_small_components(
+        cleaned,
+        min_area=min_area,
+        baseline_row=baseline_row,
+    )
 
     intermediates = {
         "08_opened": opened,
@@ -812,7 +904,7 @@ def prune_skeleton(skeleton):
 
     Removes connected components that are either:
       - Smaller than SKELETON_MIN_BRANCH_LENGTH pixels (tiny stubs), or
-      - Horizontal lines (height <= 3 and width >= 20).
+      - Horizontal lines (height <= 3 and width >= SKELETON_HORIZONTAL_LINE_MIN_WIDTH).
 
     Parameters
     ----------
@@ -833,7 +925,7 @@ def prune_skeleton(skeleton):
         w = stats[i, cv2.CC_STAT_WIDTH]
         h = stats[i, cv2.CC_STAT_HEIGHT]
         is_small = area < SKELETON_MIN_BRANCH_LENGTH
-        is_horizontal_line = h <= 3 and w >= 20
+        is_horizontal_line = h <= 3 and w >= SKELETON_HORIZONTAL_LINE_MIN_WIDTH
         if is_small or is_horizontal_line:
             pruned[labels == i] = 0
     return pruned

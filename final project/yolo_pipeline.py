@@ -2,19 +2,20 @@
 YOLO-Seg pipeline for SEM dendrite segmentation.
 
 Uses ultralytics YOLOv11 instance segmentation with transfer learning
-from COCO pretrained weights. Handles dataset validation, training,
-single/batch inference, and mask extraction.
+from COCO pretrained weights.  Provides dataset preparation, training,
+inference (single and batch), and skeleton extraction.
 
 Usage:
-    python yolo_pipeline.py train --data <dataset_yaml> [--epochs 100] [--model yolo11n-seg.pt]
-    python yolo_pipeline.py predict --model <weights.pt> --source <image_or_dir> [--output <dir>]
+    python yolo_pipeline.py train --data yolo_dataset/data.yaml
+    python yolo_pipeline.py predict --model best.pt --source data/raw/Easy
+    python yolo_pipeline.py                          # synthetic self-test
 """
 
+import argparse
 import cv2
 import numpy as np
 import os
 import sys
-import argparse
 
 from skimage.morphology import skeletonize
 
@@ -26,87 +27,130 @@ from utils import load_image, save_image, list_images
 # Training hyperparameters
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "yolo11n-seg.pt"   # Nano model — fast training, decent accuracy
-DEFAULT_EPOCHS = 100
-DEFAULT_IMGSZ = 640
-DEFAULT_BATCH = 8
-DEFAULT_PATIENCE = 20              # Early stopping patience
-DEFAULT_FREEZE = 10                # Freeze first N backbone layers
-DEFAULT_LR0 = 0.001                # Initial learning rate
-DEFAULT_CONF = 0.25                # Inference confidence threshold
+DEFAULT_MODEL = "yolo11n-seg.pt"    # Nano model for fast training
+DEFAULT_EPOCHS = 100                # max epochs (early stopping may cut short)
+DEFAULT_IMGSZ = 640                 # square input size for YOLO
+DEFAULT_BATCH = 8                   # batch size (reduce if GPU OOM)
+DEFAULT_PATIENCE = 20               # early stopping: epochs without improvement
+DEFAULT_FREEZE = 10                 # freeze first N backbone layers for transfer learning
+DEFAULT_LR0 = 0.001                 # initial learning rate
+DEFAULT_CONF = 0.25                 # inference confidence threshold
+DEFAULT_WORKERS = 0 if sys.platform == "win32" else 8  # dataloader workers
 
 
 # ===========================================================================
 # Dataset preparation
 # ===========================================================================
 
-def prepare_yolo_dataset(roboflow_dir, output_yaml=None):
+def normalize_dataset_images(dataset_dir):
     """
-    Validate a Roboflow YOLO-Segmentation export and create/verify dataset.yaml.
+    Convert all dataset images to 3-channel PNG format.
 
-    Expected Roboflow export structure:
-        roboflow_dir/
-        ├── data.yaml
-        ├── train/
-        │   ├── images/
-        │   └── labels/
-        ├── valid/
-        │   ├── images/
-        │   └── labels/
-        └── test/   (optional)
-            ├── images/
-            └── labels/
+    YOLO pretrained models expect 3-channel (BGR) input.  SEM images are
+    typically grayscale TIF files.  This function:
+      1. Converts grayscale/RGBA images to 3-channel BGR
+      2. Rewrites non-PNG files as PNG (avoids TIFF metadata issues)
+      3. Clears Ultralytics label cache files to force re-indexing
 
     Parameters
     ----------
-    roboflow_dir : str
-        Path to the Roboflow YOLO export directory.
-    output_yaml : str or None
-        If provided, write a corrected dataset.yaml to this path.
-        Otherwise, use roboflow_dir/data.yaml.
+    dataset_dir : str
+        Root of the YOLO dataset (containing train/valid/test subdirs).
+    """
+    converted = 0
+    total = 0
+
+    for split in ("train", "valid", "test"):
+        img_dir = os.path.join(dataset_dir, split, "images")
+        if not os.path.isdir(img_dir):
+            continue
+
+        for fname in sorted(os.listdir(img_dir)):
+            fpath = os.path.join(img_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+
+            img = cv2.imread(fpath, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                continue
+            total += 1
+
+            # Ensure 3 channels
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            elif img.ndim == 3 and img.shape[2] == 1:
+                img = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2BGR)
+            elif img.ndim == 3 and img.shape[2] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+            # Rewrite to PNG if not already
+            stem = os.path.splitext(fname)[0]
+            ext = os.path.splitext(fname)[1].lower()
+            if ext != ".png":
+                dst = os.path.join(img_dir, stem + ".png")
+                cv2.imwrite(dst, img)
+                if os.path.normcase(dst) != os.path.normcase(fpath):
+                    os.remove(fpath)
+                converted += 1
+            else:
+                cv2.imwrite(fpath, img)
+
+        # Remove stale cache so Ultralytics re-indexes
+        cache = os.path.join(dataset_dir, split, "labels.cache")
+        if os.path.isfile(cache):
+            os.remove(cache)
+
+    if total > 0:
+        print(f"  Dataset normalized: {converted}/{total} images converted to 3-ch PNG")
+
+
+def validate_dataset(dataset_dir):
+    """
+    Validate YOLO dataset structure and return path to data.yaml.
+
+    Checks that train/images, train/labels, valid/images, valid/labels
+    exist and contain matching file counts.  Normalizes images to 3-channel
+    PNG for compatibility with pretrained YOLO backbones.
+
+    Parameters
+    ----------
+    dataset_dir : str
+        Root of the YOLO dataset directory.
 
     Returns
     -------
     yaml_path : str
-        Path to the validated dataset.yaml file.
+        Path to the dataset's data.yaml file.
     """
-    # Check required directories exist
-    required = ["train/images", "train/labels", "valid/images", "valid/labels"]
-    for subdir in required:
-        full_path = os.path.join(roboflow_dir, subdir)
-        if not os.path.isdir(full_path):
+    for subdir in ("train/images", "train/labels", "valid/images", "valid/labels"):
+        full = os.path.join(dataset_dir, subdir)
+        if not os.path.isdir(full):
             raise FileNotFoundError(
-                f"Required directory not found: {full_path}\n"
-                f"Ensure you exported from Roboflow in 'YOLOv8 Segmentation' format."
+                f"Missing required directory: {full}\n"
+                f"Dataset must have train/ and valid/ splits with images/ and labels/."
             )
 
-    # Count images and labels
-    train_imgs = len(list_images(os.path.join(roboflow_dir, "train/images")))
-    valid_imgs = len(list_images(os.path.join(roboflow_dir, "valid/images")))
-    train_labels = len([f for f in os.listdir(os.path.join(roboflow_dir, "train/labels"))
-                        if f.endswith('.txt')])
-    valid_labels = len([f for f in os.listdir(os.path.join(roboflow_dir, "valid/labels"))
-                        if f.endswith('.txt')])
+    # Count files per split
+    for split in ("train", "valid", "test"):
+        img_dir = os.path.join(dataset_dir, split, "images")
+        lbl_dir = os.path.join(dataset_dir, split, "labels")
+        if not os.path.isdir(img_dir):
+            continue
+        n_img = len([f for f in os.listdir(img_dir) if not f.startswith(".")])
+        n_lbl = len([f for f in os.listdir(lbl_dir) if f.endswith(".txt")]) if os.path.isdir(lbl_dir) else 0
+        print(f"  {split}: {n_img} images, {n_lbl} labels")
+        if n_img != n_lbl and n_lbl > 0:
+            print(f"  WARNING: image/label count mismatch in {split}")
 
-    print(f"Dataset validation:")
-    print(f"  Train: {train_imgs} images, {train_labels} labels")
-    print(f"  Valid: {valid_imgs} images, {valid_labels} labels")
+    # Normalize images to 3-channel PNG
+    normalize_dataset_images(dataset_dir)
 
-    if train_imgs == 0:
-        raise ValueError("No training images found.")
-    if train_imgs != train_labels:
-        print(f"  WARNING: Image/label count mismatch in train "
-              f"({train_imgs} vs {train_labels})")
-
-    # Check or create dataset.yaml
-    yaml_path = output_yaml or os.path.join(roboflow_dir, "data.yaml")
-
-    if os.path.exists(yaml_path):
-        print(f"  Using existing: {yaml_path}")
-    else:
-        # Create a minimal dataset.yaml
-        yaml_content = (
-            f"path: {os.path.abspath(roboflow_dir)}\n"
+    # Verify data.yaml exists
+    yaml_path = os.path.join(dataset_dir, "data.yaml")
+    if not os.path.isfile(yaml_path):
+        # Auto-generate minimal data.yaml
+        content = (
+            f"path: {os.path.abspath(dataset_dir)}\n"
             f"train: train/images\n"
             f"val: valid/images\n"
             f"\n"
@@ -114,9 +158,11 @@ def prepare_yolo_dataset(roboflow_dir, output_yaml=None):
             f"names:\n"
             f"  0: dendrite\n"
         )
-        with open(yaml_path, 'w') as f:
-            f.write(yaml_content)
-        print(f"  Created dataset.yaml at: {yaml_path}")
+        with open(yaml_path, "w") as f:
+            f.write(content)
+        print(f"  Created data.yaml at {yaml_path}")
+    else:
+        print(f"  Using existing data.yaml: {yaml_path}")
 
     return yaml_path
 
@@ -125,62 +171,66 @@ def prepare_yolo_dataset(roboflow_dir, output_yaml=None):
 # Training
 # ===========================================================================
 
-def train_yolo(dataset_yaml, model=DEFAULT_MODEL, epochs=DEFAULT_EPOCHS,
-               imgsz=DEFAULT_IMGSZ, batch=DEFAULT_BATCH,
-               patience=DEFAULT_PATIENCE, freeze=DEFAULT_FREEZE,
-               lr0=DEFAULT_LR0, project=None):
+def train_model(dataset_yaml, model=DEFAULT_MODEL, epochs=DEFAULT_EPOCHS,
+                imgsz=DEFAULT_IMGSZ, batch=DEFAULT_BATCH,
+                patience=DEFAULT_PATIENCE, freeze=DEFAULT_FREEZE,
+                lr0=DEFAULT_LR0, workers=DEFAULT_WORKERS, project=None):
     """
-    Train YOLO-Seg model with transfer learning.
+    Fine-tune a YOLO-Seg model on the SEM dendrite dataset.
 
-    Freezes the first N backbone layers and uses a low learning rate
-    to fine-tune on SEM dendrite data.
+    Uses transfer learning: freezes the first N backbone layers and
+    trains the detection/segmentation heads with a low learning rate.
+    Early stopping halts training if validation loss plateaus.
 
     Parameters
     ----------
     dataset_yaml : str
-        Path to dataset.yaml file.
+        Path to the dataset's data.yaml file.
     model : str
-        Pretrained model name or path to .pt file.
+        Pretrained YOLO model name or path to .pt weights.
     epochs : int
-        Maximum number of training epochs.
+        Maximum training epochs.
     imgsz : int
-        Input image size (square).
+        Input image size (images are resized to imgsz x imgsz).
     batch : int
-        Batch size.
+        Training batch size.
     patience : int
-        Early stopping patience (epochs without improvement).
+        Early stopping patience (epochs without val improvement).
     freeze : int
-        Number of backbone layers to freeze.
+        Number of backbone layers to freeze during training.
     lr0 : float
         Initial learning rate.
+    workers : int
+        Number of dataloader workers (0 for single-process on Windows).
     project : str or None
-        Output project directory. Defaults to 'output/yolo/train'.
+        Output directory for training artifacts.
 
     Returns
     -------
-    results : ultralytics Results object
-        Training results including best model path.
+    results : ultralytics.engine.results.Results
+        Training results object with metrics and best weights path.
     """
     from ultralytics import YOLO
 
     if project is None:
-        project = os.path.join(os.path.dirname(__file__), "output", "yolo", "train")
+        project = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "output", "yolo", "train")
 
-    print(f"\n{'='*60}")
-    print(f"YOLO-Seg Training")
-    print(f"  Model:    {model}")
-    print(f"  Dataset:  {dataset_yaml}")
-    print(f"  Epochs:   {epochs}")
-    print(f"  ImgSize:  {imgsz}")
-    print(f"  Batch:    {batch}")
-    print(f"  Patience: {patience}")
-    print(f"  Freeze:   {freeze} layers")
-    print(f"  LR0:      {lr0}")
-    print(f"{'='*60}\n")
+    print(f"\n{'=' * 60}")
+    print(f"Training YOLO-Seg Model")
+    print(f"  Base model:  {model}")
+    print(f"  Dataset:     {dataset_yaml}")
+    print(f"  Epochs:      {epochs}")
+    print(f"  Image size:  {imgsz}")
+    print(f"  Batch:       {batch}")
+    print(f"  Patience:    {patience}")
+    print(f"  Freeze:      {freeze} layers")
+    print(f"  LR:          {lr0}")
+    print(f"  Workers:     {workers}")
+    print(f"{'=' * 60}\n")
 
-    yolo_model = YOLO(model)
-
-    results = yolo_model.train(
+    yolo = YOLO(model)
+    results = yolo.train(
         data=dataset_yaml,
         epochs=epochs,
         imgsz=imgsz,
@@ -188,14 +238,15 @@ def train_yolo(dataset_yaml, model=DEFAULT_MODEL, epochs=DEFAULT_EPOCHS,
         patience=patience,
         freeze=freeze,
         lr0=lr0,
+        workers=workers,
         project=project,
         name="dendrite_seg",
         exist_ok=True,
         verbose=True,
     )
 
-    best_path = os.path.join(project, "dendrite_seg", "weights", "best.pt")
-    print(f"\nTraining complete. Best weights: {best_path}")
+    best_weights = os.path.join(project, "dendrite_seg", "weights", "best.pt")
+    print(f"\nTraining complete. Best weights saved to: {best_weights}")
     return results
 
 
@@ -203,110 +254,49 @@ def train_yolo(dataset_yaml, model=DEFAULT_MODEL, epochs=DEFAULT_EPOCHS,
 # Inference
 # ===========================================================================
 
-def predict_single(model_path, image_path, conf=DEFAULT_CONF):
+def extract_mask(model, image_path, conf=DEFAULT_CONF):
     """
-    Run YOLO-Seg inference on a single image and extract the binary mask.
+    Run YOLO-Seg on a single image and merge all instance masks.
 
-    Combines all detected instance masks via logical OR into a single
-    binary mask representing all dendrite pixels.
+    All detected dendrite instances are combined via logical OR into one
+    binary mask covering all dendrite pixels.
 
     Parameters
     ----------
-    model_path : str
-        Path to trained YOLO weights (.pt file).
+    model : ultralytics.YOLO
+        Loaded YOLO model (pass a pre-loaded model for batch efficiency).
     image_path : str
-        Path to input image.
+        Path to the input SEM image.
     conf : float
-        Confidence threshold for detections.
+        Minimum detection confidence threshold.
 
     Returns
     -------
     mask : np.ndarray
         Binary mask (0 or 255), dtype uint8, same size as input image.
     """
-    from ultralytics import YOLO
+    preds = model.predict(image_path, conf=conf, verbose=False)
 
-    model = YOLO(model_path)
-    results = model.predict(image_path, conf=conf, verbose=False)
+    # Read original image dimensions
+    orig = cv2.imread(image_path)
+    h, w = orig.shape[:2]
 
-    # Get original image dimensions
-    image = cv2.imread(image_path)
-    h, w = image.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
 
-    # Combine all instance masks into one binary mask
-    combined_mask = np.zeros((h, w), dtype=np.uint8)
+    if preds and preds[0].masks is not None:
+        # masks.data is a tensor of shape (N_instances, mask_h, mask_w)
+        for inst in preds[0].masks.data.cpu().numpy():
+            resized = cv2.resize(inst, (w, h), interpolation=cv2.INTER_LINEAR)
+            mask[resized > 0.5] = 255
 
-    if results and results[0].masks is not None:
-        masks_data = results[0].masks.data.cpu().numpy()  # (N, mH, mW)
-        for instance_mask in masks_data:
-            # Resize mask to original image dimensions
-            resized = cv2.resize(
-                instance_mask, (w, h), interpolation=cv2.INTER_LINEAR
-            )
-            combined_mask[resized > 0.5] = 255
-
-    return combined_mask
+    return mask
 
 
-def predict_batch(model_path, input_dir, output_dir, conf=DEFAULT_CONF):
+def extract_skeleton(mask):
     """
-    Run YOLO-Seg inference on all images in a directory.
+    Compute single-pixel-width skeleton from a binary mask.
 
-    Parameters
-    ----------
-    model_path : str
-        Path to trained YOLO weights (.pt file).
-    input_dir : str
-        Directory containing input images.
-    output_dir : str
-        Directory to save output masks.
-    conf : float
-        Confidence threshold.
-
-    Returns
-    -------
-    results : dict
-        Mapping of image basename to binary mask.
-    """
-    from ultralytics import YOLO
-
-    image_paths = list_images(input_dir)
-    if not image_paths:
-        print(f"No images found in {input_dir}")
-        return {}
-
-    print(f"Running YOLO inference on {len(image_paths)} images...")
-    model = YOLO(model_path)
-    os.makedirs(output_dir, exist_ok=True)
-    all_results = {}
-
-    for path in image_paths:
-        basename = os.path.splitext(os.path.basename(path))[0]
-
-        # Run inference
-        preds = model.predict(path, conf=conf, verbose=False)
-        image = cv2.imread(path)
-        h, w = image.shape[:2]
-
-        combined_mask = np.zeros((h, w), dtype=np.uint8)
-        if preds and preds[0].masks is not None:
-            masks_data = preds[0].masks.data.cpu().numpy()
-            for instance_mask in masks_data:
-                resized = cv2.resize(instance_mask, (w, h),
-                                     interpolation=cv2.INTER_LINEAR)
-                combined_mask[resized > 0.5] = 255
-
-        save_image(combined_mask, os.path.join(output_dir, f"{basename}_mask.png"))
-        all_results[basename] = combined_mask
-        print(f"  {basename}: {np.sum(combined_mask > 0)} foreground pixels")
-
-    print(f"Saved {len(all_results)} masks to {output_dir}/")
-    return all_results
-
-
-def yolo_mask_to_skeleton(mask):
-    """
-    Extract skeleton from a YOLO-generated binary mask.
+    Uses Zhang-Suen thinning (scikit-image) to extract centerlines.
 
     Parameters
     ----------
@@ -323,67 +313,182 @@ def yolo_mask_to_skeleton(mask):
     return (skel.astype(np.uint8) * 255)
 
 
+def run_yolo_pipeline(model_path, image_path, output_dir=None, conf=DEFAULT_CONF):
+    """
+    Full YOLO inference pipeline on a single image: mask + skeleton + overlays.
+
+    Parallels run_classic_pipeline() so both can be compared side-by-side.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to trained YOLO weights (.pt file).
+    image_path : str
+        Path to input SEM image.
+    output_dir : str or None
+        Directory to save results. If None, results are not saved to disk.
+    conf : float
+        Detection confidence threshold.
+
+    Returns
+    -------
+    results : dict
+        Dictionary with 'mask', 'skeleton', and 'intermediates' keys.
+    """
+    from ultralytics import YOLO
+
+    model = YOLO(model_path)
+    basename = os.path.splitext(os.path.basename(image_path))[0]
+    print(f"YOLO predicting: {basename}")
+
+    # Extract mask and skeleton
+    mask = extract_mask(model, image_path, conf=conf)
+    skeleton = extract_skeleton(mask)
+
+    fg_pixels = int(np.sum(mask > 0))
+    skel_pixels = int(np.sum(skeleton > 0))
+    print(f"  Mask: {fg_pixels} fg pixels, Skeleton: {skel_pixels} pixels")
+
+    # Save outputs
+    if output_dir:
+        img_dir = os.path.join(output_dir, basename)
+        os.makedirs(img_dir, exist_ok=True)
+        save_image(mask, os.path.join(img_dir, "yolo_mask.png"))
+        save_image(skeleton, os.path.join(img_dir, "yolo_skeleton.png"))
+
+        # Generate overlay: skeleton in red on original
+        orig = load_image(image_path, grayscale=True)
+        overlay = cv2.cvtColor(orig, cv2.COLOR_GRAY2BGR)
+        overlay[skeleton > 0] = (0, 0, 255)
+        save_image(overlay, os.path.join(img_dir, "yolo_overlay.png"))
+
+    return {
+        "mask": mask,
+        "skeleton": skeleton,
+        "intermediates": {"yolo_mask": mask, "yolo_skeleton": skeleton},
+    }
+
+
+def predict_directory(model_path, input_dir, output_dir, conf=DEFAULT_CONF):
+    """
+    Run YOLO-Seg inference on all images in a directory.
+
+    Loads the model once and reuses it across all images for efficiency.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to trained YOLO weights (.pt file).
+    input_dir : str
+        Directory of input SEM images.
+    output_dir : str
+        Directory to save masks, skeletons, and overlays.
+    conf : float
+        Detection confidence threshold.
+
+    Returns
+    -------
+    all_results : dict
+        Mapping of image basename to results dict.
+    """
+    from ultralytics import YOLO
+
+    image_paths = list_images(input_dir)
+    if not image_paths:
+        print(f"No images found in {input_dir}")
+        return {}
+
+    model = YOLO(model_path)
+    os.makedirs(output_dir, exist_ok=True)
+    all_results = {}
+
+    print(f"YOLO batch inference on {len(image_paths)} images...\n")
+
+    for path in image_paths:
+        basename = os.path.splitext(os.path.basename(path))[0]
+
+        mask = extract_mask(model, path, conf=conf)
+        skeleton = extract_skeleton(mask)
+
+        # Save mask and skeleton
+        save_image(mask, os.path.join(output_dir, f"{basename}_mask.png"))
+        save_image(skeleton, os.path.join(output_dir, f"{basename}_skeleton.png"))
+
+        fg = int(np.sum(mask > 0))
+        print(f"  {basename}: {fg} fg pixels")
+        all_results[basename] = {"mask": mask, "skeleton": skeleton}
+
+    print(f"\nSaved {len(all_results)} results to {output_dir}/")
+    return all_results
+
+
 # ===========================================================================
 # CLI entry point
 # ===========================================================================
 
 def main():
+    """Command-line interface for the YOLO-Seg pipeline."""
     parser = argparse.ArgumentParser(
         description="YOLO-Seg pipeline for SEM dendrite segmentation"
     )
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+    sub = parser.add_subparsers(dest="command", help="Available commands")
 
-    # Train command
-    train_parser = subparsers.add_parser("train", help="Train YOLO-Seg model")
-    train_parser.add_argument("--data", required=True, help="Path to dataset.yaml")
-    train_parser.add_argument("--model", default=DEFAULT_MODEL,
-                              help=f"Pretrained model (default: {DEFAULT_MODEL})")
-    train_parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    train_parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
-    train_parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
-    train_parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
-    train_parser.add_argument("--freeze", type=int, default=DEFAULT_FREEZE)
-    train_parser.add_argument("--lr0", type=float, default=DEFAULT_LR0)
-    train_parser.add_argument("--project", default=None)
+    # --- train ---
+    tp = sub.add_parser("train", help="Train YOLO-Seg model on labeled dataset")
+    tp.add_argument("--data", required=True,
+                    help="Path to data.yaml (or dataset root directory)")
+    tp.add_argument("--model", default=DEFAULT_MODEL)
+    tp.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    tp.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
+    tp.add_argument("--batch", type=int, default=DEFAULT_BATCH)
+    tp.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
+    tp.add_argument("--freeze", type=int, default=DEFAULT_FREEZE)
+    tp.add_argument("--lr0", type=float, default=DEFAULT_LR0)
+    tp.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    tp.add_argument("--project", default=None, help="Output project directory")
 
-    # Predict command
-    pred_parser = subparsers.add_parser("predict", help="Run inference")
-    pred_parser.add_argument("--model", required=True, help="Path to weights (.pt)")
-    pred_parser.add_argument("--source", required=True,
-                             help="Image path or directory")
-    pred_parser.add_argument("--output", default=None,
-                             help="Output directory for masks")
-    pred_parser.add_argument("--conf", type=float, default=DEFAULT_CONF)
+    # --- predict ---
+    pp = sub.add_parser("predict", help="Run inference on image(s)")
+    pp.add_argument("--model", required=True, help="Path to trained .pt weights")
+    pp.add_argument("--source", required=True, help="Image file or directory")
+    pp.add_argument("--output", default=None, help="Output directory")
+    pp.add_argument("--conf", type=float, default=DEFAULT_CONF)
 
     args = parser.parse_args()
 
     if args.command == "train":
-        yaml_path = prepare_yolo_dataset(
-            os.path.dirname(args.data), output_yaml=args.data
-        )
-        train_yolo(
-            yaml_path, model=args.model, epochs=args.epochs,
-            imgsz=args.imgsz, batch=args.batch, patience=args.patience,
-            freeze=args.freeze, lr0=args.lr0, project=args.project
+        # Determine dataset root from data.yaml path
+        data_path = args.data
+        if os.path.isfile(data_path):
+            dataset_dir = os.path.dirname(data_path)
+        else:
+            dataset_dir = data_path
+            data_path = os.path.join(dataset_dir, "data.yaml")
+
+        yaml_path = validate_dataset(dataset_dir)
+        train_model(
+            yaml_path,
+            model=args.model, epochs=args.epochs, imgsz=args.imgsz,
+            batch=args.batch, patience=args.patience, freeze=args.freeze,
+            lr0=args.lr0, workers=args.workers, project=args.project,
         )
 
     elif args.command == "predict":
-        if not os.path.exists(args.model):
-            print(f"Error: Model not found: {args.model}")
+        if not os.path.isfile(args.model):
+            print(f"Error: weights not found: {args.model}")
             sys.exit(1)
 
-        output_dir = args.output or os.path.join(
-            os.path.dirname(__file__), "output", "yolo"
+        out = args.output or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "output", "yolo"
         )
 
         if os.path.isdir(args.source):
-            predict_batch(args.model, args.source, output_dir, conf=args.conf)
+            predict_directory(args.model, args.source, out, conf=args.conf)
+        elif os.path.isfile(args.source):
+            run_yolo_pipeline(args.model, args.source, out, conf=args.conf)
         else:
-            mask = predict_single(args.model, args.source, conf=args.conf)
-            basename = os.path.splitext(os.path.basename(args.source))[0]
-            save_image(mask, os.path.join(output_dir, f"{basename}_mask.png"))
-            print(f"Saved mask: {np.sum(mask > 0)} foreground pixels")
-
+            print(f"Error: source not found: {args.source}")
+            sys.exit(1)
     else:
         parser.print_help()
 
@@ -392,37 +497,37 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         main()
     else:
-        # Synthetic self-test (no ultralytics needed)
+        # Synthetic self-test (no ultralytics required)
         print("=== yolo_pipeline.py — Synthetic Self-Test ===\n")
 
-        # Test dataset validation with a fake structure
-        test_dir = os.path.join(os.path.dirname(__file__), "output", "_yolo_test")
-        for subdir in ["train/images", "train/labels", "valid/images", "valid/labels"]:
-            os.makedirs(os.path.join(test_dir, subdir), exist_ok=True)
+        # Build a temporary dataset structure
+        test_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "output", "_yolo_selftest")
+        for sub in ("train/images", "train/labels", "valid/images", "valid/labels"):
+            os.makedirs(os.path.join(test_dir, sub), exist_ok=True)
 
-        # Create dummy files
-        dummy_img = np.zeros((64, 64), dtype=np.uint8)
+        # Create minimal dummy data
+        dummy = np.zeros((64, 64), dtype=np.uint8)
         for i in range(3):
-            cv2.imwrite(os.path.join(test_dir, "train/images", f"img{i}.png"), dummy_img)
-            with open(os.path.join(test_dir, "train/labels", f"img{i}.txt"), 'w') as f:
-                f.write("0 0.5 0.5 0.6 0.5 0.6 0.6 0.5 0.6\n")
-        for i in range(2):
-            cv2.imwrite(os.path.join(test_dir, "valid/images", f"img{i}.png"), dummy_img)
-            with open(os.path.join(test_dir, "valid/labels", f"img{i}.txt"), 'w') as f:
-                f.write("0 0.3 0.3 0.4 0.3 0.4 0.4 0.3 0.4\n")
+            cv2.imwrite(os.path.join(test_dir, "train/images", f"d{i}.png"), dummy)
+            with open(os.path.join(test_dir, "train/labels", f"d{i}.txt"), "w") as f:
+                f.write("0 0.4 0.4 0.6 0.4 0.6 0.6 0.4 0.6\n")
+        cv2.imwrite(os.path.join(test_dir, "valid/images", "d0.png"), dummy)
+        with open(os.path.join(test_dir, "valid/labels", "d0.txt"), "w") as f:
+            f.write("0 0.3 0.3 0.5 0.3 0.5 0.5 0.3 0.5\n")
 
-        yaml_path = prepare_yolo_dataset(test_dir)
-        print(f"\nDataset YAML created at: {yaml_path}")
+        yaml_path = validate_dataset(test_dir)
+        print(f"\nValidated dataset, yaml at: {yaml_path}")
 
         # Test skeleton extraction
         test_mask = np.zeros((100, 100), dtype=np.uint8)
-        cv2.line(test_mask, (20, 10), (20, 90), 255, 5)
-        cv2.line(test_mask, (20, 50), (80, 50), 255, 3)
-        skeleton = yolo_mask_to_skeleton(test_mask)
-        print(f"Skeleton test — mask pixels: {np.sum(test_mask > 0)}, "
-              f"skeleton pixels: {np.sum(skeleton > 0)}")
+        cv2.line(test_mask, (50, 10), (50, 90), 255, 6)
+        cv2.line(test_mask, (50, 50), (90, 50), 255, 4)
+        skel = extract_skeleton(test_mask)
+        print(f"Skeleton test: mask={np.sum(test_mask > 0)} px, "
+              f"skel={np.sum(skel > 0)} px")
 
-        # Cleanup test directory
+        # Cleanup
         import shutil
         shutil.rmtree(test_dir)
         print("\nAll YOLO pipeline tests passed.")
