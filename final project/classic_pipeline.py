@@ -4,7 +4,7 @@ Classic CV pipeline for SEM dendrite segmentation.
 Four-stage pipeline:
   A. Pre-processing  — histogram normalization, CLAHE, bilateral filter
   B. Segmentation    — adaptive thresholding (primary), Otsu (fallback)
-  C. Post-processing — morphological reconstruction, closing,
+  C. Post-processing — morphological reconstruction,
                        small component removal, substrate band removal
                        (two-stage: smoothed FG + intensity profile),
                        top band removal, edge noise removal,
@@ -29,7 +29,7 @@ from skimage.morphology import reconstruction, skeletonize
 
 # Add project directory to path for imports
 sys.path.insert(0, os.path.dirname(__file__))
-from utils import load_image, save_image, list_images, clean_sem_image
+from utils import load_image, save_image, list_images, clean_sem_image, create_overlay
 
 # ---------------------------------------------------------------------------
 # Tunable parameters (all constants at top for easy adjustment)
@@ -44,18 +44,14 @@ BILATERAL_SIGMA_COLOR = 50
 BILATERAL_SIGMA_SPACE = 50
 BILATERAL_PASSES = 1
 
-GAUSSIAN_KSIZE = 1
-
 # Stage B: Segmentation
 ADAPTIVE_BLOCK_SIZE = 67
 ADAPTIVE_C = -12
 
 # Stage C: Post-processing
-OPENING_KERNEL_SIZE = 1
 EROSION_KERNEL_SIZE = 3
 EROSION_ITERATIONS = 1
-CLOSING_KERNEL_SIZE = 3
-MIN_COMPONENT_AREA = 150
+MIN_COMPONENT_AREA = 90
 MIN_COMPONENT_AREA_FRACTION = 0.00005
 MIN_COMPONENT_AREA_MAX = 320
 NOISE_COMPONENT_COUNT_THRESHOLD = 25000
@@ -72,15 +68,19 @@ SUBSTRATE_FG_WINDOW = 20               # moving-average window (rows) for FG smo
 SUBSTRATE_INTENSITY_JUMP_RATIO = 0.25  # min contrast ratio (bottom vs top) for Stage 2
 SUBSTRATE_INTENSITY_SMOOTH_K = 41      # kernel size for row-mean intensity smoothing
 SUBSTRATE_INTENSITY_MIN_RUN = 50       # min contiguous bright rows for intensity detection
+SUBSTRATE_INTENSITY_MIN_CUTOFF_RATIO = 0.55   # Stage 2 cutoff must stay in lower 45%
+SUBSTRATE_INTENSITY_MIN_KEEP_RATIO = 0.60     # reject Stage 2 if it erases too much mask
+SUBSTRATE_INTENSITY_MAX_BOTTOM_FG_RATIO = 0.80  # bottom band must be visibly sparser
 
 # Top-band suppression (bright header / nanopore pattern at image top)
 TOP_BAND_FG_THRESHOLD = 0.30           # row-FG threshold for top-band detection
 TOP_BAND_MIN_ROWS = 20                 # minimum run of dense rows to trigger removal
 TOP_BAND_MAX_FRACTION = 0.15           # cap: never remove more than 15% of image height
 
-# Edge noise removal (small components hugging left/right margins)
-EDGE_MARGIN_FRACTION = 0.05            # fraction of width defining edge zone
-EDGE_COMPONENT_MAX_AREA = 2000         # max area for a component to be considered edge noise
+# Edge noise removal (tiny specks actually touching the left/right borders)
+EDGE_COMPONENT_MAX_AREA = 80           # max area for a component to be considered edge noise
+EDGE_COMPONENT_MAX_WIDTH_FRACTION = 0.015
+EDGE_COMPONENT_MAX_HEIGHT_FRACTION = 0.05
 
 # Stage D: Separation
 DISTANCE_THRESHOLD = 0.35  # fraction of max distance for watershed markers
@@ -165,26 +165,9 @@ def apply_bilateral_filter(image):
     return result
 
 
-def apply_gaussian_blur(image):
-    """
-    Moderate Gaussian smoothing to further suppress noise after bilateral.
-
-    Parameters
-    ----------
-    image : np.ndarray
-        Grayscale image (H, W), dtype uint8.
-
-    Returns
-    -------
-    blurred : np.ndarray
-        Smoothed image.
-    """
-    return cv2.GaussianBlur(image, (GAUSSIAN_KSIZE, GAUSSIAN_KSIZE), 0)
-
-
 def preprocess(image):
     """
-    Full pre-processing pipeline: clean → normalize → CLAHE → bilateral.
+    Full pre-processing pipeline: clean, normalize, CLAHE, bilateral.
 
     Parameters
     ----------
@@ -202,7 +185,6 @@ def preprocess(image):
     normalized = normalize_histogram(cleaned)
     clahe_img = apply_clahe(normalized)
     bilateral_img = apply_bilateral_filter(clahe_img)
-    smoothed = apply_gaussian_blur(bilateral_img)
 
     intermediates = {
         "01_original": image,
@@ -210,9 +192,8 @@ def preprocess(image):
         "03_normalized": normalized,
         "04_clahe": clahe_img,
         "05_bilateral": bilateral_img,
-        "06_smoothed": smoothed,
     }
-    return smoothed, intermediates
+    return bilateral_img, intermediates
 
 
 # ===========================================================================
@@ -368,26 +349,6 @@ def morphological_reconstruction(mask):
 
     reconstructed = (reconstructed_f * 255).astype(np.uint8)
     return reconstructed
-
-
-def apply_closing(mask):
-    """
-    Morphological closing to fill small holes and ensure branch continuity.
-
-    Parameters
-    ----------
-    mask : np.ndarray
-        Binary mask (0 or 255), dtype uint8.
-
-    Returns
-    -------
-    closed : np.ndarray
-        Closed binary mask.
-    """
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (CLOSING_KERNEL_SIZE, CLOSING_KERNEL_SIZE)
-    )
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
 def remove_small_components(mask, min_area=None, baseline_row=None):
@@ -576,7 +537,7 @@ def remove_substrate_band(mask, preprocessed=None):
         return mask  # not enough contrast — no clear substrate
 
     # Find transition row: scan upward from bottom, find where intensity
-    # drops below the dark region's baseline + a margin
+    # drops below the dark region's baseline + a margin.
     threshold_intensity = top_median + 0.35 * (bot_median - top_median)
     transition = h - 1
     run_count = 0
@@ -597,8 +558,27 @@ def remove_substrate_band(mask, preprocessed=None):
         return mask  # transition too close to bottom, not meaningful
 
     cutoff = max(0, transition - SUBSTRATE_MARGIN_ROWS)
+    cutoff_ratio = cutoff / float(h)
+
+    # Stage 2 is prone to cutting through real trees on Hard images.
+    # Only trust it when the candidate band is low enough in the frame,
+    # materially sparser than the region above, and does not erase most
+    # of the foreground mask.
+    if cutoff_ratio < SUBSTRATE_INTENSITY_MIN_CUTOFF_RATIO:
+        return mask
+
+    above_fg = float(np.mean(row_fg[:cutoff])) if cutoff > 0 else 0.0
+    bottom_fg = float(np.mean(row_fg[cutoff:])) if cutoff < h else 0.0
+    if above_fg <= 0:
+        return mask
+    if bottom_fg > above_fg * SUBSTRATE_INTENSITY_MAX_BOTTOM_FG_RATIO:
+        return mask
+
     cleaned = mask.copy()
     cleaned[cutoff:, :] = 0
+    keep_ratio = np.count_nonzero(cleaned) / float(max(1, np.count_nonzero(mask)))
+    if keep_ratio < SUBSTRATE_INTENSITY_MIN_KEEP_RATIO:
+        return mask
     return cleaned
 
 
@@ -650,12 +630,13 @@ def remove_top_band(mask):
 
 def remove_edge_noise(mask):
     """
-    Remove small connected components whose centroids hug the left or right
-    image margins.
+    Remove tiny connected components that actually touch the left or right
+    image borders.
 
     SEM images sometimes have noise or annotation artifacts near the edges.
-    Any component with centroid within EDGE_MARGIN_FRACTION of either side
-    AND area below EDGE_COMPONENT_MAX_AREA is removed.
+    Real dendrites can legitimately approach the sides, so this filter is
+    deliberately conservative: a component must touch a border, be tiny,
+    and remain spatially compact to be removed.
 
     Parameters
     ----------
@@ -668,23 +649,26 @@ def remove_edge_noise(mask):
         Mask with edge-hugging small components removed.
     """
     h, w = mask.shape[:2]
-    margin = int(w * EDGE_MARGIN_FRACTION)
+    max_w = max(12, int(w * EDGE_COMPONENT_MAX_WIDTH_FRACTION))
+    max_h = max(20, int(h * EDGE_COMPONENT_MAX_HEIGHT_FRACTION))
 
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         mask, connectivity=8
     )
     cleaned = mask.copy()
 
     for i in range(1, num_labels):
-        cx = centroids[i, 0]  # x-coordinate of centroid
-        area = stats[i, cv2.CC_STAT_AREA]
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        comp_w = int(stats[i, cv2.CC_STAT_WIDTH])
+        comp_h = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
 
-        # Check if centroid is within edge margin and component is small
-        near_left = cx < margin
-        near_right = cx > (w - margin)
-        small_enough = area < EDGE_COMPONENT_MAX_AREA
+        touches_left = x <= 1
+        touches_right = (x + comp_w) >= (w - 1)
+        small_enough = area <= EDGE_COMPONENT_MAX_AREA
+        compact = comp_w <= max_w and comp_h <= max_h
 
-        if (near_left or near_right) and small_enough:
+        if (touches_left or touches_right) and small_enough and compact:
             cleaned[labels == i] = 0
 
     return cleaned
@@ -738,9 +722,9 @@ def remove_bottom_horizontal_artifacts(mask):
 def postprocess(mask, preprocessed=None):
     """
     Full post-processing pipeline:
-    opening → reconstruction → closing → component cleanup → band removal.
+    reconstruction → component cleanup → band removal.
 
-    The cleanup chain after closing is:
+    The cleanup chain after reconstruction is:
       1. detect baseline + cut below it
       2. remove substrate/top/edge/horizontal artifacts
       3. remove_small_components (with baseline-band preservation)
@@ -760,30 +744,22 @@ def postprocess(mask, preprocessed=None):
     intermediates : dict
         Dictionary of intermediate masks for visualization.
     """
-    # Kill isolated noise pixels with morphological opening
-    open_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (OPENING_KERNEL_SIZE, OPENING_KERNEL_SIZE)
-    )
-    opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
-
-    recon = morphological_reconstruction(opened)
-    pre_recon_area = int(np.count_nonzero(opened))
+    recon = morphological_reconstruction(mask)
+    pre_recon_area = int(np.count_nonzero(mask))
     recon_area = int(np.count_nonzero(recon))
     keep_ratio = (recon_area / float(pre_recon_area)) if pre_recon_area > 0 else 1.0
     if keep_ratio < RECON_MIN_KEEP_RATIO:
         # Reconstruction can erase thin trees on sparse images.
         # If too much is lost, keep the pre-reconstruction mask.
-        recon = opened.copy()
+        recon = mask.copy()
         print(
             f"  Reconstruction fallback: keep={keep_ratio:.1%} < "
             f"{RECON_MIN_KEEP_RATIO:.0%}; using pre-reconstruction mask."
         )
 
-    closed = apply_closing(recon)
-
     # Remove known geometric artifacts before size filtering.
-    baseline_row = detect_baseline_row(closed)
-    cleaned = zero_below_baseline(closed, baseline_row)
+    baseline_row = detect_baseline_row(recon)
+    cleaned = zero_below_baseline(recon, baseline_row)
     cleaned = remove_substrate_band(cleaned, preprocessed)
     cleaned = remove_top_band(cleaned)
     cleaned = remove_edge_noise(cleaned)
@@ -798,10 +774,8 @@ def postprocess(mask, preprocessed=None):
     )
 
     intermediates = {
-        "08_opened": opened,
-        "09_reconstructed": recon,
-        "10_closed": closed,
-        "11_small_removed": cleaned,
+        "07_reconstructed": recon,
+        "08_small_removed": cleaned,
     }
     return cleaned, intermediates
 
@@ -1054,7 +1028,7 @@ def run_classic_pipeline(image_path, output_dir=None, save_intermediates=True):
 
     # Stage B: Segmentation (adaptive-first with fallback + auto-inversion)
     seg_mask = segment(preprocessed)
-    preprocess_ints["07_segmented"] = seg_mask
+    preprocess_ints["06_segmented"] = seg_mask
 
     # Stage C: Post-processing (pass preprocessed for intensity-based substrate detection)
     clean_mask, postprocess_ints = postprocess(seg_mask, preprocessed)
@@ -1069,8 +1043,12 @@ def run_classic_pipeline(image_path, output_dir=None, save_intermediates=True):
     all_intermediates = {}
     all_intermediates.update(preprocess_ints)
     all_intermediates.update(postprocess_ints)
-    all_intermediates["12_separated"] = separated
-    all_intermediates["13_skeleton"] = skeleton
+    all_intermediates["09_separated"] = separated
+    all_intermediates["10_skeleton"] = skeleton
+
+    # Overlays: skeleton (red) and mask (green) on original
+    overlay_skel = create_overlay(image, skeleton, color=(0, 0, 255), alpha=0.70)
+    overlay_mask = create_overlay(image, separated, color=(0, 255, 0), alpha=0.55)
 
     # Save results
     if output_dir and save_intermediates:
@@ -1078,11 +1056,15 @@ def run_classic_pipeline(image_path, output_dir=None, save_intermediates=True):
         os.makedirs(img_out_dir, exist_ok=True)
         for name, img in all_intermediates.items():
             save_image(img, os.path.join(img_out_dir, f"{name}.png"))
-        print(f"  Saved {len(all_intermediates)} intermediate images to {img_out_dir}/")
+        save_image(overlay_skel, os.path.join(img_out_dir, "overlay_skel_on_orig.png"))
+        save_image(overlay_mask, os.path.join(img_out_dir, "overlay_mask_on_orig.png"))
+        print(f"  Saved {len(all_intermediates) + 2} intermediate images to {img_out_dir}/")
     elif output_dir:
         os.makedirs(output_dir, exist_ok=True)
         save_image(separated, os.path.join(output_dir, f"{basename}_mask.png"))
         save_image(skeleton, os.path.join(output_dir, f"{basename}_skeleton.png"))
+        save_image(overlay_skel, os.path.join(output_dir, f"{basename}_overlay_skel.png"))
+        save_image(overlay_mask, os.path.join(output_dir, f"{basename}_overlay_mask.png"))
 
     results = {
         "mask": separated,
