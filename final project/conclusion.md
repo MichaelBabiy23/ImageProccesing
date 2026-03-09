@@ -6,113 +6,139 @@ Student ID: 323073734
 
 ## What We Compared
 
-We compared our classic segmentation pipeline against a reference implementation that used the same overall architecture (CLAHE, bilateral filter, adaptive threshold, morphological reconstruction, watershed, skeletonization) but with different parameter choices found through systematic parameter sweeping.
+We compared our classic CV pipeline against a stronger reference pipeline built around the same broad stages: contrast enhancement, edge-preserving denoising, adaptive thresholding, morphological cleanup, watershed separation, and skeletonization.
+
+The main lesson from the final debugging pass is that the largest remaining errors were not in one isolated threshold, but in how several cleanup operations interacted after segmentation.
 
 ---
 
-## Image-by-Image Analysis
+## Final Debugging Update: What Stage 8 Really Was
 
-### Easy Images (Ag_2e-9 series)
+At first, `08_small_removed.png` looked like a single "remove small components" step. After splitting the pipeline into explicit substeps, we found that stage 8 was actually a composite cleanup block:
 
-After all improvements, our pipeline reaches ~0.47x of the reference skeleton density on average. The gap varies per image:
+1. `08a_after_baseline_cut`
+2. `08b_after_substrate_removed`
+3. `08c_after_top_removed`
+4. `08d_after_edge_removed`
+5. `08e_after_bottom_artifact_removed`
+6. `08_small_removed` (the final connected-component size filter)
 
-**Best performers (0.50-0.59x):**
+This changed the diagnosis completely. On the difficult Hard images, the original problem was not just "small components." The real failure mode was:
 
-- **Ag_2e-9_011** (0.59x) -- Densest dendrite forest. Many thick trunks that survive reconstruction well. Our skeleton captures the main branch structure faithfully, only missing the finest tips.
-- **Ag_2e-9_018** (0.54x) -- Medium-density forest with clear branch separation. Good skeleton topology.
-- **Ag_2e-9_015** (0.53x) -- Dense forest similar to 011. Main trunks and primary branches are well traced.
-- **Ag_2e-9_010** (0.53x) -- Good branch structure. Skeleton traces most branches.
-- **Ag_2e-9_009** (0.50x) -- Dense forest. Main structure captured, but many fine side branches lost by reconstruction.
+- the intensity-based substrate removal sometimes climbed too high and cut through real roots
+- the old edge filter also removed legitimate side branches near the left and right margins
+- after those cuts disconnected the tree, the final size filter removed many of the remaining fragments
 
-These images have larger, thicker dendrites. Our pipeline handles them well because the thick branches survive morphological reconstruction. The missing ~45-50% of skeleton pixels are fine tips and thin side branches that reconstruction erodes away.
+So the last visible loss in `08_small_removed.png` was often caused by mistakes that happened earlier inside the same stage.
 
-**Weaker performers (0.32-0.47x):**
+---
 
-- **Ag_2e-9_020** (0.47x) -- Many thin branches. Reconstruction strips tips.
-- **Ag_2e-9_019** (0.45x) -- Similar to 020, thin branch structures.
-- **Ag_2e-9_014** (0.45x) -- Sparse, thin dendrites. Many small branches lost.
-- **Ag_2e-9_013** (0.36x) -- Very sparse, small dendrites. Many branches are small enough to be removed entirely by reconstruction.
-- **Ag_2e-9_012** (0.32x) -- Sparsest image. Many tiny dendrites that are at the threshold of detection. Reconstruction removes ~45% of the segmented signal.
+## Easy Images
 
-The pattern: images with thinner, sparser dendrites suffer more. The morphological reconstruction (erode-then-dilate-within-bounds) destroys thin branches because the erosion marker is empty where branches are only 1-2 pixels wide.
+For the Easy set, the baseline and substrate logic is still useful, but it had to be constrained more tightly.
 
-### Why Theirs Is Better: Stage-by-Stage Breakdown
+The current behavior is:
 
-Tracing image 009 through both pipelines:
+- `08a_after_baseline_cut` removes the bright band below the dendrite base
+- `08b_after_substrate_removed` now removes only a narrow strip above that baseline
 
-```
-Stage                  THEIRS       OURS         Notes
--------------------------------------------------------
-Segmentation          82,850 (20%) 59,921 (14%) -28% from less aggressive preprocessing
-  (no opening)                     (skipped)     We removed opening too
-Reconstruction        70,788 (17%) 49,635 (12%) Theirs has fallback mechanism
-  keep-ratio:          85.4%       82.8%         Theirs retries if too much lost
-Closing               80,227 (19%) 51,800 (12%) Gap maintained
-Small-comp removal    53,411 (13%) 35,354 ( 8%) Both filter noise
-Skeleton               6,850        3,392        0.50x ratio
-```
+After the latest fix, substrate removal is capped to at most 8 rows above the detected baseline. In practice, on the Easy images it now trims roughly 2-8 rows above the baseline instead of 13-19 rows as before. This preserves more of the short dendrite stumps while still removing the bright substrate/interface band.
 
-The losses compound at every stage:
-1. **Segmentation** (-28%): Their preprocessing preserves more contrast, so C=-9 captures more dendrite pixels.
-2. **Reconstruction** (-5%): Their fallback mechanism retries with gentler erosion when too much is removed.
-3. **Small-component removal** (-10%): Our substrate/edge/band removal is more aggressive.
+This means the Easy images now fail less by over-cutting the base and more by the usual issue: the finest branches are still fragile after segmentation and cleanup.
 
-### Hard Images
+---
 
-After improvements, our Hard images show:
+## Hard Images
 
-- **Ag_40nm_pitch_001-007**: Substrate removal works well. Dendrite trees in the dark upper region are captured. Some residual noise specks from the C=-9 threshold in the background (visible as scattered red dots). Mask coverage 1-6%, which is plausible.
-- **70nm_pitch_035**: Top band removal helps. Mask at 20% still has some periodic pattern contamination.
-- **70nm_pitch_036, surface_036**: Unchanged failure cases (~30% mask). Periodic nanopore pattern is indistinguishable from dendrites at pixel level.
+The Hard `Ag_40nm_pitch_*` images were the most informative part of the analysis.
+
+### What was going wrong
+
+On several images, especially `Ag_40nm_pitch_001`, `002`, `004`, and `006`, the intensity-based substrate detector interpreted the brighter lower half of the SEM image as substrate and removed too much of the actual tree. In parallel, the old side filter treated real terminal branches near the margins as edge noise.
+
+### What changed
+
+We added three guardrails:
+
+1. The intensity-based substrate cutoff is now accepted only when it stays low enough in the image.
+2. The candidate bottom band must be visibly sparser than the region above it.
+3. If a baseline is known, substrate removal cannot climb more than 8 rows above it.
+
+We also made edge cleanup much stricter:
+
+- only tiny, compact components that actually touch the image border are removed
+- components merely near the side margins are kept
+
+### What remains difficult
+
+These fixes stopped the obvious over-cutting in `Ag_40nm_pitch_001` and similar cases. The lower arbor and side branches are now preserved much better in the intermediate outputs.
+
+The main remaining weakness on Hard images is now the final component filter in `08_small_removed`, especially when the segmentation is already fragmented. `Ag_40nm_pitch_005` is still a clear failure case: it is no longer cut for the same substrate reason, but the final mask is still too sparse because many surviving fragments remain too small or too disconnected.
+
+The `70nm_*` images remain structurally difficult for a different reason: periodic background patterns can still look too similar to dendrites at the pixel level.
 
 ---
 
 ## What We Changed and Why
 
-### Changes that helped (adopted):
+### Stable improvements that remain important
 
-1. **ADAPTIVE_C: +5 to -9** -- The single biggest fix. Switches from segmenting the negative space (dark gaps between noise) to directly capturing bright dendrites. With C=+5, we needed polarity inversion and got blobby masks. With C=-9, we get tight masks that preserve fine branches.
+1. `ADAPTIVE_C = -12`
+   The most important segmentation choice. It selects bright dendrites directly instead of forcing a polarity inversion from the negative space.
 
-2. **ADAPTIVE_BLOCK_SIZE: 51 to 67** -- Larger neighborhood provides more stable local mean estimate on SEM images with gradual illumination gradients.
+2. Larger local context for adaptive thresholding
+   A larger block size gives a more stable estimate of the local mean on SEM images with slow intensity drift.
 
-3. **CLAHE_CLIP_LIMIT: 3.0 to 2.0** -- Less noise amplification in dark background regions.
+3. Gentler denoising
+   Lower CLAHE amplification, one bilateral pass, and no Gaussian blur preserve more branch edges before thresholding.
 
-4. **BILATERAL_SIGMA: 75 to 50** -- Less aggressive smoothing preserves fine dendrite edges that the selective threshold needs.
+4. Reconstruction fallback
+   If morphological reconstruction removes too much foreground, the pipeline now falls back to the pre-reconstruction mask instead of forcing the loss.
 
-5. **BILATERAL_PASSES: 2 to 1** -- Second pass was killing dendrite signal. Single pass provides sufficient denoising for C=-9.
+### Stage-8 fixes from the final analysis
 
-6. **Removed Gaussian blur** -- Extra smoothing was eroding dendrite edges below the selective threshold.
+5. Removed opening and closing in the `classic_no_open_close` variant
+   These morphology steps were erasing real thin branches before the more targeted cleanup logic had a chance to operate.
 
-7. **EROSION_ITERATIONS: 2 to 1** -- With cleaner input from C=-9, single iteration suffices. Two iterations destroyed thin branches.
+6. Lowered `MIN_COMPONENT_AREA` from 150 to 90
+   This was needed after we saw that many legitimate terminal fragments were being deleted only because earlier cleanup had disconnected them.
 
-8. **CLOSING_KERNEL_SIZE: 5 to 3** -- Smaller kernel causes less morphological distortion.
+7. Made substrate removal conservative
+   The intensity-based substrate detector now has explicit safety checks and is clamped relative to the detected baseline.
 
-9. **DISTANCE_THRESHOLD: 0.4 to 0.3** -- More aggressive watershed separation for touching branches.
+8. Tightened edge cleanup
+   The filter now removes only border-touching compact specks, not any small object near the left or right side.
 
-10. **Removed morphological opening** -- Opening was killing 8,000-15,000 dendrite pixels per image (fine tips and small branches). The noise it targeted is now handled by small-component removal.
+9. Exposed every stage-8 substep as a saved image
+   This was crucial. Once stage 8 was decomposed, the real source of the errors became obvious.
 
-11. **MIN_COMPONENT_AREA: 50 to 150** -- Raised to compensate for removing opening. Catches noise specks that opening used to handle.
+---
 
-12. **Simplified segmentation selection** -- Removed noise-ratio check that was rejecting the correct C=-9 adaptive mask in favor of worse Otsu.
+## What Still Separates Us from the Reference
 
-### Remaining architectural differences (not adopted):
+The reference pipeline is still denser on very fine tips and fragmented side branches. The remaining gap is now mostly:
 
-1. **Reconstruction fallback** -- Their pipeline retries reconstruction with gentler parameters (kernel=3, iterations=1) if the default removes more than 25% of the mask. If even the gentle version removes too much, they skip reconstruction entirely and use the original mask. This preserves thin branches that our fixed reconstruction destroys.
+1. Better preservation of disconnected thin fragments
+   Their post-processing is still more tolerant of very small but meaningful branch pieces.
 
-2. **Band-component restoration** -- After substrate removal, they scan for small connected components whose bottom edge lies in a 30-pixel band above the baseline cutoff. These are small dendrite stumps growing from the substrate that substrate removal accidentally clips. They restore these from the pre-removal mask.
+2. Better handling of difficult root regions
+   Even after the substrate fix, our final cleanup can still be too aggressive when the lower tree is already fragmented.
 
-3. **Baseline detection approach** -- They detect the substrate baseline by finding the longest run of rows with >90% foreground in the bottom half of the image, rather than our smoothed-FG approach. Different strategy, similar results.
+3. Better robustness on periodic Hard backgrounds
+   The `70nm_*` images still contain repeating structures that are difficult to reject using purely local morphology and thresholding.
 
 ---
 
 ## Summary
 
-Our pipeline improved significantly through parameter tuning (especially ADAPTIVE_C=-9), but the reference implementation remains ~2x denser in skeleton coverage. The gap breaks down as:
+The final conclusion is different from what we first thought.
 
-- **~30% from segmentation**: Their preprocessing chain preserves more dendrite contrast
-- **~15% from reconstruction**: Their fallback mechanism prevents over-erosion of thin branches
-- **~10% from post-processing**: Their band-component restoration preserves small dendrites near the substrate
+The biggest issue was not simply that "small-component removal was too aggressive." The deeper problem was that stage 8 bundled several cleanup operations together under one filename, which hid where the real damage was happening.
 
-The segmentation gap is a fundamental preprocessing trade-off. The reconstruction and restoration gaps are architectural features that could be adopted to close most of the remaining distance.
+After splitting stage 8 and adding guards:
 
-For the presentation: our pipeline correctly identifies and traces all major dendrite structures. The reference implementation additionally captures fine tips and small side branches, giving a more complete morphological description. Both pipelines successfully separate dendrites from background, remove substrate artifacts, and produce valid skeletons -- the difference is in the coverage of the finest structures.
+- substrate removal no longer cuts far above the baseline
+- side branches near the image margins are no longer deleted as edge noise
+- the pipeline is much easier to inspect and debug
+
+The current bottleneck is now clearer: on difficult Hard images, the final connected-component filtering is still too destructive once the dendrite tree becomes fragmented. That is a more precise and more useful conclusion than the earlier assumption that the whole post-processing block was uniformly wrong.

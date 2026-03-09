@@ -71,6 +71,7 @@ SUBSTRATE_INTENSITY_MIN_RUN = 50       # min contiguous bright rows for intensit
 SUBSTRATE_INTENSITY_MIN_CUTOFF_RATIO = 0.55   # Stage 2 cutoff must stay in lower 45%
 SUBSTRATE_INTENSITY_MIN_KEEP_RATIO = 0.60     # reject Stage 2 if it erases too much mask
 SUBSTRATE_INTENSITY_MAX_BOTTOM_FG_RATIO = 0.80  # bottom band must be visibly sparser
+SUBSTRATE_MAX_ROWS_ABOVE_BASELINE = 8  # cap how far substrate removal can climb above baseline
 
 # Top-band suppression (bright header / nanopore pattern at image top)
 TOP_BAND_FG_THRESHOLD = 0.30           # row-FG threshold for top-band detection
@@ -448,7 +449,7 @@ def zero_below_baseline(mask, baseline_row):
     return out
 
 
-def remove_substrate_band(mask, preprocessed=None):
+def remove_substrate_band(mask, preprocessed=None, baseline_row=None):
     """
     Remove the bright substrate/electrode base ("ground of the trees") where
     dendrites grow from.  Uses a two-stage approach to handle both dense
@@ -474,6 +475,10 @@ def remove_substrate_band(mask, preprocessed=None):
         Pre-processed grayscale image (H, W), used for Stage 2 intensity
         analysis.  If None, only Stage 1 is applied (backward compatible).
 
+    baseline_row : int or None
+        Optional detected baseline row. If available, substrate removal is
+        prevented from climbing too far above that baseline.
+
     Returns
     -------
     cleaned : np.ndarray
@@ -482,6 +487,11 @@ def remove_substrate_band(mask, preprocessed=None):
     binary = mask > 0
     h, w = binary.shape
     row_fg = np.mean(binary, axis=1)  # per-row foreground ratio [0, 1]
+
+    def clamp_cutoff(cutoff):
+        if baseline_row is None:
+            return cutoff
+        return max(int(cutoff), max(0, int(baseline_row) - SUBSTRATE_MAX_ROWS_ABOVE_BASELINE))
 
     # --- Stage 1: Smoothed FG scan from bottom ---
     # Apply moving average to smooth out oscillations in grain boundaries
@@ -503,8 +513,7 @@ def remove_substrate_band(mask, preprocessed=None):
 
     if run >= min_rows:
         # Stage 1 found substrate — zero everything below cutoff
-        cutoff = (i + 1) - SUBSTRATE_MARGIN_ROWS
-        cutoff = max(0, cutoff)
+        cutoff = clamp_cutoff(max(0, (i + 1) - SUBSTRATE_MARGIN_ROWS))
         cleaned = mask.copy()
         cleaned[cutoff:, :] = 0
         return cleaned
@@ -557,7 +566,7 @@ def remove_substrate_band(mask, preprocessed=None):
     if transition >= h - min_rows:
         return mask  # transition too close to bottom, not meaningful
 
-    cutoff = max(0, transition - SUBSTRATE_MARGIN_ROWS)
+    cutoff = clamp_cutoff(max(0, transition - SUBSTRATE_MARGIN_ROWS))
     cutoff_ratio = cutoff / float(h)
 
     # Stage 2 is prone to cutting through real trees on Hard images.
@@ -759,22 +768,31 @@ def postprocess(mask, preprocessed=None):
 
     # Remove known geometric artifacts before size filtering.
     baseline_row = detect_baseline_row(recon)
-    cleaned = zero_below_baseline(recon, baseline_row)
-    cleaned = remove_substrate_band(cleaned, preprocessed)
-    cleaned = remove_top_band(cleaned)
-    cleaned = remove_edge_noise(cleaned)
-    cleaned = remove_bottom_horizontal_artifacts(cleaned)
+    after_baseline = zero_below_baseline(recon, baseline_row)
+    after_substrate = remove_substrate_band(
+        after_baseline,
+        preprocessed,
+        baseline_row=baseline_row,
+    )
+    after_top = remove_top_band(after_substrate)
+    after_edge = remove_edge_noise(after_top)
+    after_bottom_artifacts = remove_bottom_horizontal_artifacts(after_edge)
 
     # Adaptive small-component filtering to preserve sparse dendrite tips.
-    min_area = choose_min_component_area(cleaned)
+    min_area = choose_min_component_area(after_bottom_artifacts)
     cleaned = remove_small_components(
-        cleaned,
+        after_bottom_artifacts,
         min_area=min_area,
         baseline_row=baseline_row,
     )
 
     intermediates = {
         "07_reconstructed": recon,
+        "08a_after_baseline_cut": after_baseline,
+        "08b_after_substrate_removed": after_substrate,
+        "08c_after_top_removed": after_top,
+        "08d_after_edge_removed": after_edge,
+        "08e_after_bottom_artifact_removed": after_bottom_artifacts,
         "08_small_removed": cleaned,
     }
     return cleaned, intermediates
