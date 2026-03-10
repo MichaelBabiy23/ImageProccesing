@@ -36,7 +36,7 @@ from utils import load_image, save_image, list_images, clean_sem_image, create_o
 # ---------------------------------------------------------------------------
 
 # Stage A: Pre-processing
-CLAHE_CLIP_LIMIT = 1.5
+CLAHE_CLIP_LIMIT = 1.2
 CLAHE_TILE_SIZE = 8
 
 BILATERAL_D = 9
