@@ -40,7 +40,7 @@ CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_SIZE = 8
 
 BILATERAL_D = 9
-BILATERAL_SIGMA_COLOR = 50
+BILATERAL_SIGMA_COLOR = 50  # TODO setting it this high with a BILATERAL_D of 9 basically means nothing.
 BILATERAL_SIGMA_SPACE = 50
 BILATERAL_PASSES = 1
 
@@ -221,7 +221,7 @@ def segment_adaptive(image):
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
         ADAPTIVE_BLOCK_SIZE,
-        ADAPTIVE_C
+        ADAPTIVE_C # we got to C after intense testing (landed on -12)
     )
     return mask
 
