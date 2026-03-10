@@ -36,7 +36,7 @@ from utils import load_image, save_image, list_images, clean_sem_image, create_o
 # ---------------------------------------------------------------------------
 
 # Stage A: Pre-processing
-CLAHE_CLIP_LIMIT = 2.0
+CLAHE_CLIP_LIMIT = 1.5
 CLAHE_TILE_SIZE = 8
 
 BILATERAL_D = 9
@@ -1145,7 +1145,7 @@ def main():
     )
     parser.add_argument(
         "--output", default=None,
-        help="Output directory (default: output/classic/)"
+        help="Output directory (default: output/classic-changed-clip-clahe-1.5/)"
     )
     parser.add_argument(
         "--no-intermediates", action="store_true",
@@ -1155,7 +1155,7 @@ def main():
     args = parser.parse_args()
 
     project_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = args.output or os.path.join(project_dir, "output", "classic")
+    output_dir = args.output or os.path.join(project_dir, "output", "classic-changed-clip-clahe-1.5")
 
     if args.image:
         # Single image mode
