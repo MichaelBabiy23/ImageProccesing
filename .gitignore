@@ -1,2 +1,9 @@
 final project/test/
 final project/yolo_dataset/
+*.zip
+*.pt
+__pycache__/
+final project/yolo_training/runs/
+final project/yolo_viewer/all output/
+final project/yolo_viewer/all output one color/
+final project/yolo_viewer/test output/
