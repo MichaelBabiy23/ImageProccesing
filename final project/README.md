@@ -10,6 +10,26 @@ Student ID: 323073734
 pip install -r requirements.txt
 ```
 
+## Interactive GUI
+
+Windows launcher:
+
+```bash
+run-gui.bat
+```
+
+macOS / Linux:
+
+```bash
+python3 pipeline_gui.py
+```
+
+On macOS you can also use the bundled launcher:
+
+```bash
+./run-gui.command
+```
+
 ## Classic Pipeline
 
 Stages: histogram normalization, CLAHE, bilateral filter, adaptive thresholding, morphological reconstruction, closing, small component removal, distance transform + watershed separation, and skeletonization.

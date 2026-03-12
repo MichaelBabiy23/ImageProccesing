@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>סגמנטציה של דנדריטים בתמונות SEM</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 16mm 15mm 18mm 15mm;
+    }
+
+    :root {
+      --text: #1d1d1f;
+      --muted: #5f6368;
+      --line: #d7d7d7;
+      --accent: #204b3a;
+      --paper: #fffefc;
+      --table-head: #eef3ef;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--paper);
+      font-family: "Noto Sans Hebrew", "Arial", sans-serif;
+      line-height: 1.65;
+      font-size: 15px;
+    }
+
+    .page {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 18mm 20mm 24mm;
+    }
+
+    h1, h2, h3, h4 {
+      color: var(--accent);
+      break-after: avoid-page;
+      page-break-after: avoid;
+    }
+
+    h1 {
+      font-size: 30px;
+      margin: 0 0 12px;
+      text-align: center;
+      letter-spacing: 0.2px;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin: 30px 0 10px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 6px;
+    }
+
+    h3 {
+      font-size: 18px;
+      margin: 24px 0 8px;
+    }
+
+    h4 {
+      font-size: 16px;
+      margin: 18px 0 6px;
+    }
+
+    p, li {
+      text-align: justify;
+    }
+
+    .title-block {
+      text-align: center;
+      margin-bottom: 28px;
+      padding-bottom: 18px;
+      border-bottom: 2px solid var(--line);
+    }
+
+    .meta {
+      color: var(--muted);
+      margin: 4px 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0 18px;
+      font-size: 14px;
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      vertical-align: top;
+    }
+
+    th {
+      background: var(--table-head);
+      font-weight: 700;
+    }
+
+    figure {
+      margin: 20px 0 26px;
+      break-inside: avoid;
+      page-break-inside: avoid;
+      text-align: center;
+    }
+
+    img {
+      max-width: 100%;
+      height: auto;
+      border: 1px solid var(--line);
+    }
+
+    figcaption {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    code {
+      background: #f3f3f3;
+      padding: 1px 4px;
+      border-radius: 4px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 0.95em;
+      direction: ltr;
+      unicode-bidi: embed;
+    }
+
+    .note {
+      margin-top: 20px;
+      padding: 10px 12px;
+      border-right: 4px solid #caa55a;
+      background: #fff8e7;
+    }
+
+    @media print {
+      .page {
+        max-width: none;
+        padding: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="title-block">
+      <h1>סגמנטציה של דנדריטים בתמונות SEM</h1>
+      <p class="meta">מגישים: <strong>Michael Babiy</strong>, <strong>Shlomo [להשלים שם משפחה]</strong></p>
+      <p class="meta">ת"ז: <strong>323073734</strong>, <strong>[להשלים]</strong></p>
+      <p class="small">גרסה זו מיועדת להדפסה או ל-Print to PDF ישירות מהדפדפן.</p>
+    </section>
+
+    <h2>1. תקציר</h2>
+    <p>בפרויקט זה פותחה מערכת לסגמנטציה אוטומטית של דנדריטים בתמונות SEM. מטרת המערכת היא להפריד בין מבנה הדנדריט לבין הרקע, להסיר ארטיפקטים אופייניים של המיקרוסקופ, ולהפיק גם שלד חד-פיקסלי לצורך ניתוח מבני עתידי.</p>
+    <p>הפתרון המרכזי שמומש מבוסס על pipeline קלאסי לעיבוד תמונה, הכולל נרמול היסטוגרמה, שיפור ניגודיות מקומי באמצעות CLAHE, סינון bilateral משמר קצוות, סגמנטציה באמצעות adaptive thresholding, ניקוי מורפולוגי, הסרת אזורי רקע בעייתיים, הפרדת ענפים נוגעים באמצעות distance transform ו-Watershed, ולבסוף Skeletonization. בנוסף נבנה GUI אינטראקטיבי לצורך כיוונון פרמטרים, ניתוח שלבים והשוואה בין קונפיגורציות שונות.</p>
+    <p>ממצאי הפרויקט מראים כי ה-pipeline הקלאסי מספק תוצאות חזקות במיוחד בקבוצת התמונות הקלות, וכן בחלק מן התמונות הקשות. ברוב מקרי הכמעט-הצלחה הכשל איננו כשל יסודי של הסגמנטציה, אלא בעיית ניקוי מקומית, בעיקר סביב <code>baseline cut</code> או <code>top band removal</code>. בהתאם לכך, הדוח מתמקד בדוגמאות המייצגות ביותר, לצד מספר מקרי גבול שמסבירים היכן נדרש שיפור נוסף.</p>
+
+    <h2>2. מתודולוגיה</h2>
+    <h3>2.1 הגדרת הבעיה</h3>
+    <p>דנדריטים הם מבנים מתכתיים מיקרוסקופיים בעלי גיאומטריה מסועפת, הצומחים על פני האנודה במהלך מחזורי טעינה ופריקה של סוללות ליתיום. צמיחתם עלולה לגרום לקצר פנימי ולכן יש חשיבות גבוהה לזיהויים ולמדידתם מתוך תמונות SEM.</p>
+    <p>האתגר המרכזי בסגמנטציה של דנדריטים נובע מכך שתמונות SEM כוללות רעש, אי-אחידות בתאורה, אזורי רוויה, קווי רקע בוהקים ולעיתים גם טקסטורות מחזוריות הדומות חזותית לענפים דקים. מסיבה זו, שיטות סף גלובליות פשוטות אינן מספקות ברוב המקרים.</p>
+
+    <h3>2.2 ה-pipeline הקלאסי</h3>
+    <ol>
+      <li><strong>קדם-עיבוד</strong>: ניקוי טקסט ו-scale bar, נרמול היסטוגרמה, CLAHE וסינון bilateral.</li>
+      <li><strong>סגמנטציה</strong>: שימוש ב-adaptive thresholding, עם אפשרות גיבוי ל-Otsu.</li>
+      <li><strong>ניקוי לאחר סגמנטציה</strong>: reconstruction מורפולוגי, <code>baseline cut</code>, הסרת substrate, הסרת top band, הסרת רעשי שוליים והסרת רכיבים קטנים.</li>
+      <li><strong>עיבוד מבני</strong>: הפרדת ענפים נוגעים באמצעות distance transform ו-Watershed, ולאחר מכן Skeletonization.</li>
+    </ol>
+
+    <h3>2.3 ה-GUI ככלי ניתוח וכיוונון</h3>
+    <p>לצורך כיוונון המערכת נבנה GUI אינטראקטיבי המציג את כל שלבי ה-pipeline, החל מ-<code>01_original</code> ועד <code>10_skeleton</code>. הממשק שימש ככלי מרכזי להבנת מקרי שגיאה, ובפרט לזיהוי מדויק של פגיעה הנגרמת מ-<code>baseline cut</code> אגרסיבי מדי או מ-<code>top band removal</code> שאינו מספק.</p>
+
+    <h3>2.4 ה-pipeline המבוסס Deep Learning</h3>
+    <p>לפי דרישות הפרויקט, יש להתייחס גם ל-pipeline מבוסס Deep Learning. במסגרת הפרויקט הוכנה תשתית ל-YOLO-Seg, כולל מבנה דאטהסט, קבצי תיוג וקבצי משקלים. תצורת האימון שהוכנה מבוססת על <code>yolo11n-seg.pt</code> עם <code>epochs=100</code>, <code>imgsz=640</code>, <code>batch=8</code>, <code>patience=20</code>, <code>freeze=10</code>, <code>lr0=0.001</code> ו-<code>conf=0.25</code>.</p>
+    <p>הדאטהסט הקיים בפרויקט קטן מאוד וכולל 7 תמונות אימון, תמונת validation אחת ו-2 תמונות test. לכן, בשלב הנוכחי, ה-pipeline הזה משמש בעיקר כתשתית השוואה עתידית. בריצה הקיימת נצפתה תנודתיות גבוהה במדדי ה-mAP, דבר שמצביע על כך שהדאטהסט קטן מדי להשוואה כמותית יציבה.</p>
+
+    <h3>2.5 פירוט מלא של ה-pipeline הקלאסי</h3>
+    <h4>שלב א: קדם-עיבוד</h4>
+    <p>בשלב הראשון התמונה עוברת ניקוי של פסי metadata ושל טקסט המיקרוסקופ, ולאחר מכן מתבצע נרמול היסטוגרמה לטווח <code>[0,255]</code>. מטרת הנרמול היא לייצר בסיס עקבי בין תמונות בעלות חשיפה שונה. לאחר מכן מופעל CLAHE, שמבצע שיפור ניגודיות מקומי במקום שיפור גלובלי, וכך מאפשר להבליט ענפים חלשים גם כאשר התאורה איננה אחידה.</p>
+    <p>לאחר שיפור הניגודיות מופעל bilateral filter. בניגוד לטשטוש גאוסי רגיל, bilateral מנסה להחליק רעש בלי למחוק קצוות חזקים. זהו השלב שמקטין grain של SEM אך עדיין שומר על גבולות הדנדריט.</p>
+
+    <h4>שלב ב: סגמנטציה</h4>
+    <p>בשלב הסגמנטציה מיוצרות שתי מסכות: מסכת adaptive thresholding ומסכת Otsu. לאחר מכן המערכת בודקת איזו מסכה סבירה יותר מבחינת יחס foreground, בעיקר באזור העליון של התמונה. בנוסף מתבצע תיקון polarity אם foreground הופך לרוב הפיקסלים.</p>
+
+    <h4>שלב ג: ניקוי לאחר סגמנטציה</h4>
+    <p>זהו השלב החשוב ביותר מבחינת יציבות. תחילה מתבצע morphological reconstruction: המסכה נשחקת ל-marker קטן יותר, ואז נבנית מחדש בתוך גבולות המסכה המקורית. לאחר מכן מופעל בלוק הניקוי של שלב 8, שהופרד לתת-שלבים: <code>baseline cut</code>, הסרת substrate, הסרת top band, הסרת edge noise, הסרת ארטיפקטים אופקיים בתחתית, ולבסוף סינון רכיבים קטנים.</p>
+    <p>ההפרדה הזו היתה קריטית, משום שהיא חשפה שהבעיה בתמונות הקשות לא היתה "רכיבים קטנים" בלבד, אלא אינטראקציה בין מספר צעדי ניקוי שקדמו לכך.</p>
+
+    <h4>שלב ד: הפרדה ושלד</h4>
+    <p>לאחר ניקוי המסכה מופעל distance transform, ובעזרת Watershed ניתן לפצל ענפים נוגעים. לאחר מכן מתבצע Skeletonization כדי להמיר את המסכה לקווי אמצע חד-פיקסליים. השלד עובר pruning להסרת רכיבים זעירים וקווים אופקיים מלאכותיים, ולאחר מכן הסרת spurs, כלומר שלוחות קצרות שאינן מייצגות ענף אמיתי.</p>
+
+    <h3>2.6 בחירת פרמטרים ותהליך הניסויים</h3>
+    <p>בחירת הפרמטרים לא בוצעה באופן חד-פעמי, אלא באמצעות תהליך איטרטיבי של ניסויי A/B ב-GUI. בכל ניסוי שונה פרמטר אחד או קבוצה קטנה של פרמטרים, ונבחנה ההשפעה על תמונות Easy ותמונות Hard. בכל מקרה לא הסתפקנו במסכה הסופית בלבד, אלא עברנו שלב-שלב על intermediate outputs כדי לזהות היכן נוצר הרווח והיכן נגרם הנזק.</p>
+
+    <h4>הניסויים המרכזיים</h4>
+    <ol>
+      <li><strong>סף אדפטיבי</strong>: <code>ADAPTIVE_C = -12</code> נמצא כפרמטר המשמעותי ביותר. כאשר <code>C</code> הוזז לכיוון <code>0</code>, המסכה התרחבה והפכה רועשת; כאשר הוקטן יותר מדי, ענפים דקים נעלמו. <code>ADAPTIVE_BLOCK_SIZE = 67</code> נבחר משום שחלון קטן יותר יצר מסכה עצבנית ומחוררת, ואילו חלון גדול מדי פספס פרטים מקומיים.</li>
+      <li><strong>ניגודיות ודנויזינג</strong>: ערכי CLAHE גבוהים יותר חיזקו רעש והילות סביב קצוות. לכן נבחרו <code>CLAHE_CLIP_LIMIT = 0.5</code> ו-<code>CLAHE_TILE_SIZE = 8</code>. עבור bilateral filter נמצא כי יותר ממעבר אחד ריכך ענפים דקים, ולכן נבחר <code>BILATERAL_PASSES = 1</code>.</li>
+      <li><strong>Reconstruction</strong>: הגדלת גרעין השחיקה או מספר האיטרציות גרמה לפירוק ענפים חלשים. לכן נבחרו <code>EROSION_KERNEL_SIZE = 3</code>, <code>EROSION_ITERATIONS = 1</code>, ונוסף <code>RECON_MIN_KEEP_RATIO = 0.72</code> כדי לאפשר fallback.</li>
+      <li><strong>Baseline ו-substrate</strong>: זה היה אזור הניסוי המרכזי. <code>BASELINE_DETECT_MIN_ROW_RATIO = 0.80</code> ו-<code>BASELINE_DETECT_SEARCH_START_RATIO = 0.60</code> נבחרו כך שהחיפוש יתחיל בחצי התחתון של התמונה אך לא יחתוך מוקדם מדי. אחת התוספות החשובות ביותר היתה <code>SUBSTRATE_MAX_ROWS_ABOVE_BASELINE = 8</code>.</li>
+      <li><strong>רכיבים קטנים</strong>: בעקבות מחיקה של קצות ענפים, הסף ירד ל-<code>MIN_COMPONENT_AREA = 90</code> ונוספה הגנה על band קטן מעל ה-baseline באמצעות <code>SMALL_TREE_BAND_HEIGHT = 30</code>.</li>
+      <li><strong>Top band ו-edge noise</strong>: נבחרו <code>TOP_BAND_FG_THRESHOLD = 0.30</code>, <code>TOP_BAND_MIN_ROWS = 20</code>, <code>TOP_BAND_MAX_FRACTION = 0.15</code>, וכן <code>EDGE_COMPONENT_MAX_AREA = 80</code> כדי להיות שמרניים מאוד במחיקת אובייקטים בקצה.</li>
+      <li><strong>Watershed ושלד</strong>: <code>DISTANCE_THRESHOLD = 0.35</code> סיפק איזון טוב בין חוסר פיצול לבין פיצול יתר. עבור השלד נבחרו <code>SKELETON_MIN_BRANCH_LENGTH = 8</code>, <code>SKELETON_SPUR_LENGTH = 6</code>, <code>SKELETON_HORIZONTAL_LINE_MIN_WIDTH = 40</code>.</li>
+    </ol>
+
+    <table>
+      <thead>
+        <tr>
+          <th>פרמטר</th>
+          <th>ערך סופי</th>
+          <th>מה ראינו בניסויים</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>CLAHE_CLIP_LIMIT</code></td><td>0.5</td><td>ערכים גבוהים יותר חיזקו רעש והילות</td></tr>
+        <tr><td><code>BILATERAL_PASSES</code></td><td>1</td><td>יותר מעברים ריככו ענפים דקים</td></tr>
+        <tr><td><code>ADAPTIVE_BLOCK_SIZE</code></td><td>67</td><td>קטן מדי היה רועש, גדול מדי פספס פרטים</td></tr>
+        <tr><td><code>ADAPTIVE_C</code></td><td>-12</td><td>הערך הקריטי ביותר; איזן בין רעש לבין אובדן ענפים</td></tr>
+        <tr><td><code>RECON_MIN_KEEP_RATIO</code></td><td>0.72</td><td>אפשר fallback כאשר reconstruction חזק מדי</td></tr>
+        <tr><td><code>MIN_COMPONENT_AREA</code></td><td>90</td><td>ירד כדי לא למחוק שברי ענפים אמיתיים</td></tr>
+        <tr><td><code>SUBSTRATE_MAX_ROWS_ABOVE_BASELINE</code></td><td>8</td><td>מנע עלייה אגרסיבית מדי של חיתוך הבסיס</td></tr>
+        <tr><td><code>TOP_BAND_FG_THRESHOLD</code></td><td>0.30</td><td>איזן בין הסרת פס עליון לבין הגנה על תוכן אמיתי</td></tr>
+        <tr><td><code>DISTANCE_THRESHOLD</code></td><td>0.35</td><td>איזון בין under-split ל-over-split</td></tr>
+        <tr><td><code>SKELETON_SPUR_LENGTH</code></td><td>6</td><td>הסיר זיפים בלי לקצר יותר מדי ענפים אמיתיים</td></tr>
+      </tbody>
+    </table>
+
+    <h3>2.7 מדדי הערכה</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>סט הערכה</th>
+          <th>Dice</th>
+          <th>IoU</th>
+          <th>Precision</th>
+          <th>Recall</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Classic / Easy / n=10</td>
+          <td>0.926</td>
+          <td>0.863</td>
+          <td>0.915</td>
+          <td>0.938</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>3. תוצאות ודיון</h2>
+    <h3>3.1 עקרונות בחירת הדוגמאות</h3>
+    <p>הדוגמאות שנבחרו נועדו לייצג תמונות Easy חזקות, תמונות Hard שבהן הפלט עדיין משכנע, ותמונת מגבלה אחת המדגישה את חשיבות איכות הקלט. בחירה זו מאפשרת דיון תמציתי אך מייצג.</p>
+
+    <h3>3.2 דוגמאות מייצגות</h3>
+
+    <h4>Easy: דוגמאות חזקות</h4>
+    <p>התמונה <code>Ag_1e-8_004</code> מהווה דוגמה נקייה במיוחד. המסכה עוקבת היטב אחרי גזעי הדנדריטים והענפים המשניים, כמעט ללא זיהויי שווא ברקע.</p>
+    <figure>
+      <img src="output/classic/Easy/Ag_1e-8_004/overlay_mask_on_orig.png" alt="Ag_1e-8_004">
+      <figcaption>איור 1: <code>Ag_1e-8_004</code> - דוגמה מייצגת לתמונה קלה שבה הסגמנטציה שומרת היטב על המבנה המסועף ועל אזור הבסיס.</figcaption>
+    </figure>
+
+    <p>התמונה <code>Ag_2e-9_011</code> מדגימה גם הפקת שלד מוצלחת, עם קווים העוברים קרוב למרכז הענפים.</p>
+    <figure>
+      <img src="output/classic/Easy/Ag_2e-9_011/overlay_skel_on_orig.png" alt="Ag_2e-9_011 skeleton">
+      <figcaption>איור 2: <code>Ag_2e-9_011</code> - שלד חד-פיקסלי ברור ורציף, המדגים הפקה מוצלחת של ייצוג מבני בנוסף למסכה הבינארית.</figcaption>
+    </figure>
+
+    <p>התמונה <code>2e-9_100s_010</code> מייצגת תוצאה חזקה מאוד עם שארית קלה בלבד באזור הבסיס.</p>
+    <figure>
+      <img src="output/classic/Easy/2e-9_100s_010/overlay_mask_on_orig.png" alt="2e-9_100s_010">
+      <figcaption>איור 3: <code>2e-9_100s_010</code> - תוצאה חזקה מאוד, עם שארית מינורית באזור התחתון.</figcaption>
+    </figure>
+
+    <h4>Easy: מקרי גבול עם צורך בשיפור נקודתי</h4>
+    <p>בתמונה <code>Ag_1e-8_007</code> הסגמנטציה עצמה טובה, אך <code>baseline cut</code> עדיין שמרני מדי.</p>
+    <figure>
+      <img src="output/classic/Easy/Ag_1e-8_007/overlay_mask_on_orig.png" alt="Ag_1e-8_007">
+      <figcaption>איור 4: <code>Ag_1e-8_007</code> - זיהוי טוב של הדנדריטים לצד צורך בכיוונון נוסף של <code>baseline cut</code>.</figcaption>
+    </figure>
+
+    <h4>Hard: תוצאות חזקות</h4>
+    <p>התמונה <code>Ag_40nm_pitch_008</code> היא אחת הדוגמאות הטובות ביותר מתוך קבוצת Hard.</p>
+    <figure>
+      <img src="output/classic/Hard/Ag_40nm_pitch_008/overlay_mask_on_orig.png" alt="Ag_40nm_pitch_008">
+      <figcaption>איור 5: <code>Ag_40nm_pitch_008</code> - דוגמה מובהקת לכך שהשיטה נשארת יעילה גם בתמונת Hard.</figcaption>
+    </figure>
+
+    <p>גם <code>Ag_40nm_pitch_015</code> מספקת שלד יציב ושמירה טובה על רציפות הענפים.</p>
+    <figure>
+      <img src="output/classic/Hard/Ag_40nm_pitch_015/overlay_skel_on_orig.png" alt="Ag_40nm_pitch_015 skeleton">
+      <figcaption>איור 6: <code>Ag_40nm_pitch_015</code> - הפקת שלד יציבה בתמונה קשה, עם שימור טוב של מבנה העץ.</figcaption>
+    </figure>
+
+    <p>בתמונה <code>70nm_diameter_100nm_pitch_028</code> המערכת מצליחה לעקוב אחרי מבנה מסועף צפוף יחסית גם כאשר הרקע כולל דפוס מחזורי.</p>
+    <figure>
+      <img src="output/classic/Hard/70nm_diameter_100nm_pitch_028/overlay_mask_on_orig.png" alt="70nm_diameter_100nm_pitch_028">
+      <figcaption>איור 7: <code>70nm_diameter_100nm_pitch_028</code> - דוגמה חיובית לתמונה קשה בעלת רקע מחזורי.</figcaption>
+    </figure>
+
+    <h4>Hard: הצלחה חלקית ומגבלת קלט</h4>
+    <p>התמונה <code>70nm_R_50nm_pitch_ETD_019</code> מציגה זיהוי טוב של האובייקט המרכזי, אך גם שארית ברורה של פס עליון.</p>
+    <figure>
+      <img src="output/classic/Hard/70nm_R_50nm_pitch_ETD_019/overlay_mask_on_orig.png" alt="70nm_R_50nm_pitch_ETD_019">
+      <figcaption>איור 8: <code>70nm_R_50nm_pitch_ETD_019</code> - זיהוי מוצלח של הדנדריט לצד שארית משמעותית של פס עליון.</figcaption>
+    </figure>
+
+    <p>התמונה <code>70nm_R_50nm_pitch_ETD_003</code> משמשת דוגמה למקרה שבו איכות הקלט עצמה מגבילה את שחזור המבנה.</p>
+    <figure>
+      <img src="output/classic/Hard/70nm_R_50nm_pitch_ETD_003/overlay_mask_on_orig.png" alt="70nm_R_50nm_pitch_ETD_003">
+      <figcaption>איור 9: <code>70nm_R_50nm_pitch_ETD_003</code> - דוגמה לתמונה שבה איכות הקלט מגבילה את שחזור המבנה המסועף.</figcaption>
+    </figure>
+
+    <h3>3.3 השוואה בין תמונת המקור לתמונת השלד</h3>
+    <p>אחת הדרכים החשובות להעריך את איכות ה-pipeline איננה רק לבדוק אם המסכה "נראית טוב", אלא להשוות ישירות בין תמונת המקור לבין תמונת השלד. בתמונת המקור רואים את העוצמות, המרקם והרוחב של הענפים, אך לא תמיד ברור היכן בדיוק הגבול. במסכה רואים את שטח האובייקט, אך עדיין לא תמיד ברור אם המבנה באמת רציף. בשלד נחשפת הטופולוגיה: רציפות, הסתעפויות, קטיעות וזיפים מלאכותיים.</p>
+    <table>
+      <thead>
+        <tr>
+          <th>תמונה</th>
+          <th>מה רואים במקור</th>
+          <th>מה רואים בשלד</th>
+          <th>מסקנה</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>Ag_2e-9_011</code></td><td>ענפים עבים וברורים עם בסיס יציב</td><td>קווי אמצע רציפים שמכסים היטב את העץ</td><td>מקרה חזק במיוחד שבו השלד משמר נכון את הטופולוגיה</td></tr>
+        <tr><td><code>2e-9_100s_010</code></td><td>מבנה טוב, עם שארית קלה ליד הבסיס</td><td>השלד נשאר יציב ברוב הענפים, אך מדגיש שהבסיס עדיין רגיש</td><td>הבעיה איננה באובייקט עצמו אלא באזור התחתון</td></tr>
+        <tr><td><code>Ag_40nm_pitch_015</code></td><td>מבנה קשה יותר, עם רקע פחות אחיד</td><td>השלד עדיין יוצר עץ ברור עם הסתעפויות אמינות</td><td>ה-pipeline שומר על קישוריות גם בתנאים קשים</td></tr>
+        <tr><td><code>70nm_diameter_100nm_pitch_028</code></td><td>רקע מחזורי שעלול להתבלבל עם דנדריט</td><td>השלד מדגיש גם הצלחות וגם מעט הסתעפויות עודפות</td><td>הדוגמה טובה, אך השלד חושף רגישות מסוימת לרקע המחזורי</td></tr>
+        <tr><td><code>70nm_R_50nm_pitch_ETD_003</code></td><td>המבנה חלש וקשה להפרדה</td><td>השלד מקוטע ודליל יחסית</td><td>מדובר במגבלת קלט ולא רק בניקוי לא טוב</td></tr>
+      </tbody>
+    </table>
+    <p>מסקנה חשובה מהשוואה זו היא שתמונת השלד משמשת גם ככלי ולידציה. כאשר המסכה נראית סבירה אך השלד מקוטע, המשמעות היא שהמסכה עצמה עדיין לא שומרת מספיק טוב על קישוריות הענפים. לעומת זאת, כאשר גם השלד נראה טבעי ורציף, ניתן להיות בטוחים יותר שה-skeletonization מייצג נכון את הצורה שנשמרה במסכה.</p>
+
+    <h3>3.4 טבלת מצב מסכמת</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>תמונה</th>
+          <th>דרגת קושי</th>
+          <th>מצב נוכחי</th>
+          <th>הערה</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>Ag_1e-8_004</code></td><td>Easy</td><td>מושלם</td><td>דוגמה מרכזית</td></tr>
+        <tr><td><code>Ag_1e-8_007</code></td><td>Easy</td><td>טוב מאוד</td><td>יש לחזק <code>baseline cut</code></td></tr>
+        <tr><td><code>2e-9_100s_010</code></td><td>Easy</td><td>כ-90%</td><td>אין צורך דחוף בתיקון</td></tr>
+        <tr><td><code>Ag_1e-8_011</code></td><td>Easy</td><td>כ-90%</td><td>דומה ל-<code>2e-9_100s_010</code></td></tr>
+        <tr><td><code>Ag_1e-9__02_016</code></td><td>Easy</td><td>כ-90%</td><td>יש לחזק <code>baseline cut</code></td></tr>
+        <tr><td><code>Ag_2e-9_011</code></td><td>Easy</td><td>מושלם</td><td>מסכה ושלד חזקים במיוחד</td></tr>
+        <tr><td><code>70nm_diameter_100nm_pitch_028</code></td><td>Hard</td><td>טוב מאוד</td><td>דוגמה חיובית לתמונה קשה</td></tr>
+        <tr><td><code>70nm_R_50nm_pitch_ETD_003</code></td><td>Hard</td><td>חלקי</td><td>דוגמה למגבלת קלט</td></tr>
+        <tr><td><code>Ag_40nm_pitch_008</code></td><td>Hard</td><td>מושלם</td><td>אחת הדוגמאות הטובות ביותר</td></tr>
+        <tr><td><code>Ag_40nm_pitch_015</code></td><td>Hard</td><td>מושלם</td><td>דוגמה חזקה נוספת</td></tr>
+        <tr><td><code>70nm_R_50nm_pitch_ETD_019</code></td><td>Hard</td><td>כ-90%</td><td>יש לחזק <code>top band removal</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>3.5 דיון</h3>
+    <p>מן הדוגמאות שנבחרו עולות כמה תובנות מרכזיות. ראשית, ההצלחה של ה-pipeline איננה נקבעת רק על ידי שלב הסגמנטציה, אלא בעיקר על ידי איכות האינטראקציה בין שלבי הניקוי. גם כאשר adaptive thresholding מייצר מסכה ראשונית טובה, שלבי post-processing אגרסיביים מדי עלולים לפרק את העץ ולהוביל למחיקה מאוחרת של חלקים אמיתיים.</p>
+    <p>שנית, בניתוח הסופי התברר שהשם <code>08_small_removed</code> היה מטעה. בתחילה נראה היה שהכשל העיקרי הוא ב-remove small components, אך לאחר פיצול של שלב 8 לתת-שלבים התברר שהנזק המשמעותי נוצר לעיתים קודם לכן, בחיתוך בסיס, בהסרת substrate או בסינון edge noise. רק לאחר שהעץ נחתך והתנתק, הסף על רכיבים קטנים "מסיים את העבודה" ומוחק שברים אמיתיים.</p>
+    <p>שלישית, בתמונות Easy הכשל האופייני הוא בדרך כלל מקומי: קו בסיס שעוד לא הוסר באופן מלא, או אזור תחתון שנשמר מעט יותר מדי. לעומת זאת, בתמונות Hard מסוימות, ובעיקר במשפחת <code>70nm_*</code>, הבעיה עמוקה יותר: הרקע עצמו מחקה במידה מסוימת את הטקסטורה המסועפת, ולכן גם pipeline קלאסי מכוון היטב מתקשה להבחין בין מבנה לבין תבנית רקע.</p>
+    <p>רביעית, ההשוואה בין המקור, המסכה והשלד מראה שלשלד יש ערך אנליטי ולא רק ויזואלי. כאשר השלד נראה טבעי, דק ורציף, זה סימן טוב לכך שהמסכה שומרת היטב על קישוריות אמיתית. כאשר השלד מקוטע או מתמלא בזיפים, זה בדרך כלל סימן שהמסכה היתה עבה אך לא יציבה טופולוגית.</p>
+    <p>לבסוף, השוואה איכותנית בין ה-pipeline הקלאסי לבין כיוון העבודה של YOLO-Seg מבהירה את ה-tradeoff המרכזי בפרויקט. הפתרון הקלאסי שקוף מאוד: אפשר להבין כל שלב, לכוון כל פרמטר ולנתח כל כשל. לעומת זאת, pipeline מבוסס למידה עמוקה עשוי להיות חזק יותר על רקעים מורכבים מאוד, אך הוא תלוי בדאטה מתויג ובסט גדול יותר ממה שקיים כרגע במאגר.</p>
+
+    <h2>4. מסקנות</h2>
+    <h3>4.1 מסקנות מקצועיות</h3>
+    <p>ה-pipeline הקלאסי שפותח בפרויקט מספק תוצאות טובות מאוד עבור סגמנטציה של דנדריטים בתמונות SEM, במיוחד בתמונות Easy ובחלק משמעותי מן התמונות הקשות. המערכת מצליחה לא רק לזהות את גוף הדנדריט, אלא גם להפיק שלד שימושי לניתוח מבני, וזהו יתרון מעשי משמעותי משום שהשלד מאפשר מעבר טבעי למדידות של אורך, קישוריות והסתעפות.</p>
+    <p>אחת המסקנות החשובות ביותר מן העבודה היא שהבעיה אינה "למצוא סף נכון" בלבד. בפועל, הדיוק הסופי של המערכת נקבע על ידי רצף של החלטות קטנות בשלבי post-processing. לכן גם שיפור קטן בפרמטר כמו <code>SUBSTRATE_MAX_ROWS_ABOVE_BASELINE</code> או <code>MIN_COMPONENT_AREA</code> יכול לשנות בצורה דרמטית את התוצאה.</p>
+    <p>מסקנה נוספת היא שהשיטה הקלאסית מתאימה במיוחד כאשר נדרש להבין לעומק למה האלגוריתם נכשל. בכל אחד מן המקרים שנבדקו היה ניתן לשייך את הכשל לשלב ברור ב-pipeline: חיתוך בסיס, פס עליון, רכיבים קטנים או רקע מחזורי.</p>
+
+    <h3>4.2 מגבלות וכיווני המשך</h3>
+    <p>לצד היתרונות, יש לשיטה גם מגבלות ברורות. כאשר הרקע מחזורי מאוד או דומה חזותית למבנה הדנדריט, היכולת של pipeline קלאסי להפריד ביניהם מוגבלת, משום שכל ההחלטות מבוססות על עוצמה, גיאומטריה מקומית וחוקי ניקוי ידניים.</p>
+    <p>לכן, אם מטרת המערכת היא עבודה מהירה, פרשנית ונשלטת, ה-pipeline הקלאסי הוא בחירה טובה מאוד. אם המטרה היא לעמוד טוב יותר במקרים קשים מאוד או בהטרוגניות גבוהה בין דגימות, הכיוון הטבעי להמשך הוא השלמת השוואה מלאה ל-YOLO-Seg, לאחר הרחבת הדאטהסט המתויג.</p>
+    <p>במילים אחרות, הפרויקט הראה שהגישה הקלאסית כבר הגיעה לרמת בשלות טובה מאוד, אך גם חשף במדויק את הגבול שלה. זהו מצב טוב מבחינה מחקרית, משום שהשלב הבא ברור: לא לשנות הכל, אלא להרחיב את ההשוואה המונחית לדאטה ולבדוק באילו משפחות תמונות Deep Learning באמת מצדיק את המורכבות הנוספת.</p>
+
+    <h2>נספח א: נתיבי איורים מדויקים</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>תמונה</th>
+          <th>קובץ מסכה</th>
+          <th>קובץ שלד</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>Ag_1e-8_004</code></td><td><code>output/classic/Easy/Ag_1e-8_004/overlay_mask_on_orig.png</code></td><td><code>output/classic/Easy/Ag_1e-8_004/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>Ag_1e-8_007</code></td><td><code>output/classic/Easy/Ag_1e-8_007/overlay_mask_on_orig.png</code></td><td><code>output/classic/Easy/Ag_1e-8_007/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>2e-9_100s_010</code></td><td><code>output/classic/Easy/2e-9_100s_010/overlay_mask_on_orig.png</code></td><td><code>output/classic/Easy/2e-9_100s_010/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>Ag_1e-8_011</code></td><td><code>output/classic/Easy/Ag_1e-8_011/overlay_mask_on_orig.png</code></td><td><code>output/classic/Easy/Ag_1e-8_011/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>Ag_1e-9__02_016</code></td><td><code>output/classic/Easy/Ag_1e-9__02_016/overlay_mask_on_orig.png</code></td><td><code>output/classic/Easy/Ag_1e-9__02_016/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>Ag_2e-9_011</code></td><td><code>output/classic/Easy/Ag_2e-9_011/overlay_mask_on_orig.png</code></td><td><code>output/classic/Easy/Ag_2e-9_011/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>70nm_diameter_100nm_pitch_028</code></td><td><code>output/classic/Hard/70nm_diameter_100nm_pitch_028/overlay_mask_on_orig.png</code></td><td><code>output/classic/Hard/70nm_diameter_100nm_pitch_028/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>70nm_R_50nm_pitch_ETD_003</code></td><td><code>output/classic/Hard/70nm_R_50nm_pitch_ETD_003/overlay_mask_on_orig.png</code></td><td><code>output/classic/Hard/70nm_R_50nm_pitch_ETD_003/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>Ag_40nm_pitch_008</code></td><td><code>output/classic/Hard/Ag_40nm_pitch_008/overlay_mask_on_orig.png</code></td><td><code>output/classic/Hard/Ag_40nm_pitch_008/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>Ag_40nm_pitch_015</code></td><td><code>output/classic/Hard/Ag_40nm_pitch_015/overlay_mask_on_orig.png</code></td><td><code>output/classic/Hard/Ag_40nm_pitch_015/overlay_skel_on_orig.png</code></td></tr>
+        <tr><td><code>70nm_R_50nm_pitch_ETD_019</code></td><td><code>output/classic/Hard/70nm_R_50nm_pitch_ETD_019/overlay_mask_on_orig.png</code></td><td><code>output/classic/Hard/70nm_R_50nm_pitch_ETD_019/overlay_skel_on_orig.png</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="note">
+      בגרסה הנוכחית של המאגר קיימת הערכה כמותית פנימית מלאה עבור ה-pipeline הקלאסי על סט Easy, אך לא קיימת עדיין טבלת השוואה כמותית מלאה מול YOLO-Seg ברמת הדוח הסופי. לצורך הגשה סופית מומלץ להשלים טבלה זו אם תוצרי ההערכה של YOLO יהיו זמינים.
+    </div>
+  </main>
+</body>
+</html>

@@ -11,6 +11,7 @@ Features
 - Skip checkboxes per pipeline step
 - Single-stage view or all-stages grid
 - Compare mode: A vs B side-by-side in every view mode
+  - Optional difference highlighting overlays changed regions in each pane
   - Tab A and Tab B each have independent params + skips
   - "Copy A → B" copies A's current settings into B
   - Divider line between the two panels is draggable
@@ -22,6 +23,7 @@ Usage:
 
 import sys
 import os
+import json
 import traceback
 
 import cv2
@@ -29,7 +31,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from skimage.morphology import reconstruction, skeletonize
+import classic_pipeline as classic_cfg
+from skimage.morphology import skeletonize
 from utils import load_image, clean_sem_image, create_overlay
 
 try:
@@ -50,35 +53,26 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # Default parameter values
 # ─────────────────────────────────────────────────────────────────────────────
-DEFAULTS = {
-    "CLAHE_CLIP_LIMIT": 5.0,
-    "CLAHE_TILE_SIZE": 8,
-    "BILATERAL_D": 9,
-    "BILATERAL_SIGMA_COLOR": 50.0,
-    "BILATERAL_SIGMA_SPACE": 50.0,
-    "BILATERAL_PASSES": 1,
-    "ADAPTIVE_BLOCK_SIZE": 67,
-    "ADAPTIVE_C": -12,
-    "EROSION_KERNEL_SIZE": 3,
-    "EROSION_ITERATIONS": 1,
-    "MIN_COMPONENT_AREA": 90,
-    "RECON_MIN_KEEP_RATIO": 0.72,
-    "BASELINE_DETECT_MIN_ROW_RATIO": 0.80,
-    "BASELINE_DETECT_SEARCH_START_RATIO": 0.60,
-    "SMALL_TREE_BAND_HEIGHT": 30,
-    "SUBSTRATE_ROW_FG_THRESHOLD": 0.50,
-    "SUBSTRATE_MIN_HEIGHT_FRACTION": 0.06,
-    "SUBSTRATE_MARGIN_ROWS": 2,
-    "SUBSTRATE_FG_WINDOW": 20,
-    "TOP_BAND_FG_THRESHOLD": 0.30,
-    "TOP_BAND_MIN_ROWS": 20,
-    "TOP_BAND_MAX_FRACTION": 0.15,
-    "EDGE_COMPONENT_MAX_AREA": 80,
-    "DISTANCE_THRESHOLD": 0.35,
-    "SKELETON_MIN_BRANCH_LENGTH": 8,
-    "SKELETON_SPUR_LENGTH": 6,
-    "SKELETON_HORIZONTAL_LINE_MIN_WIDTH": 40,
-}
+_DEFAULT_PARAM_NAMES = (
+    "CLAHE_CLIP_LIMIT",
+    "CLAHE_TILE_SIZE",
+    "BILATERAL_D",
+    "BILATERAL_SIGMA_COLOR",
+    "BILATERAL_SIGMA_SPACE",
+    "BILATERAL_PASSES",
+    "ADAPTIVE_BLOCK_SIZE",
+    "ADAPTIVE_C",
+    "MIN_COMPONENT_AREA",
+    "BASELINE_DETECT_MIN_ROW_RATIO",
+    "BASELINE_DETECT_SEARCH_START_RATIO",
+    "SMALL_TREE_BAND_HEIGHT",
+    "DISTANCE_THRESHOLD",
+    "SKELETON_MIN_BRANCH_LENGTH",
+    "SKELETON_SPUR_LENGTH",
+    "SKELETON_HORIZONTAL_LINE_MIN_WIDTH",
+)
+
+DEFAULTS = {name: getattr(classic_cfg, name) for name in _DEFAULT_PARAM_NAMES}
 
 PARAM_SPECS = [
     # (name, lo, hi, step, is_float, group)
@@ -90,21 +84,10 @@ PARAM_SPECS = [
     ("BILATERAL_PASSES",          1,   5,      1,    False, "Stage A · Pre-processing"),
     ("ADAPTIVE_BLOCK_SIZE",       3,   401,    2,    False, "Stage B · Segmentation"),
     ("ADAPTIVE_C",               -50,  50,     1,    False, "Stage B · Segmentation"),
-    ("EROSION_KERNEL_SIZE",       1,   15,     1,    False, "Stage C · Post-processing"),
-    ("EROSION_ITERATIONS",        1,   10,     1,    False, "Stage C · Post-processing"),
     ("MIN_COMPONENT_AREA",        1,   2000,   5,    False, "Stage C · Post-processing"),
-    ("RECON_MIN_KEEP_RATIO",      0.0, 1.0,    0.01, True,  "Stage C · Post-processing"),
     ("BASELINE_DETECT_MIN_ROW_RATIO",      0.0, 1.0, 0.01, True, "Stage C · Post-processing"),
     ("BASELINE_DETECT_SEARCH_START_RATIO", 0.0, 1.0, 0.01, True, "Stage C · Post-processing"),
     ("SMALL_TREE_BAND_HEIGHT",    0,   200,    1,    False, "Stage C · Post-processing"),
-    ("SUBSTRATE_ROW_FG_THRESHOLD",   0.0, 1.0, 0.01, True, "Stage C · Substrate"),
-    ("SUBSTRATE_MIN_HEIGHT_FRACTION",0.0, 0.5, 0.005,True, "Stage C · Substrate"),
-    ("SUBSTRATE_MARGIN_ROWS",     0,   50,     1,    False, "Stage C · Substrate"),
-    ("SUBSTRATE_FG_WINDOW",       1,   100,    1,    False, "Stage C · Substrate"),
-    ("TOP_BAND_FG_THRESHOLD",     0.0, 1.0,   0.01, True,  "Stage C · Top Band"),
-    ("TOP_BAND_MIN_ROWS",         1,   200,    1,    False, "Stage C · Top Band"),
-    ("TOP_BAND_MAX_FRACTION",     0.0, 1.0,   0.01, True,  "Stage C · Top Band"),
-    ("EDGE_COMPONENT_MAX_AREA",   1,   500,    5,    False, "Stage C · Edge Noise"),
     ("DISTANCE_THRESHOLD",        0.0, 1.0,   0.01, True,  "Stage D · Separation"),
     ("SKELETON_MIN_BRANCH_LENGTH",1,   100,    1,    False, "Skeleton"),
     ("SKELETON_SPUR_LENGTH",      0,   50,     1,    False, "Skeleton"),
@@ -117,13 +100,8 @@ SKIP_SPECS = [
     ("clahe",            "Skip: CLAHE",                            "Stage A · Pre-processing"),
     ("bilateral",        "Skip: Bilateral filter",                 "Stage A · Pre-processing"),
     ("segmentation",     "Skip: Segmentation (→ empty mask)",      "Stage B · Segmentation"),
-    ("reconstruction",   "Skip: Morphological reconstruction",     "Stage C · Post-processing"),
     ("baseline_cut",     "Skip: Baseline cut",                     "Stage C · Post-processing"),
-    ("bottom_artifacts", "Skip: Bottom artifact removal",          "Stage C · Post-processing"),
     ("small_components", "Skip: Small-component removal",          "Stage C · Post-processing"),
-    ("substrate",        "Skip: Substrate removal",                "Stage C · Substrate"),
-    ("top_band",         "Skip: Top-band removal",                 "Stage C · Top Band"),
-    ("edge_noise",       "Skip: Edge noise removal",               "Stage C · Edge Noise"),
     ("separation",       "Skip: Branch separation (watershed)",    "Stage D · Separation"),
     ("skeleton",         "Skip: Skeletonisation",                  "Skeleton"),
 ]
@@ -139,12 +117,7 @@ STAGE_LABELS = [
     ("04_clahe",                          "04 · CLAHE"),
     ("05_bilateral",                      "05 · Bilateral"),
     ("06_segmented",                      "06 · Segmented"),
-    ("07_reconstructed",                  "07 · Reconstructed"),
-    ("08a_after_baseline_cut",            "08a · Baseline Cut"),
-    ("08b_after_substrate_removed",       "08b · Substrate Removed"),
-    ("08c_after_top_removed",             "08c · Top Removed"),
-    ("08d_after_edge_removed",            "08d · Edge Removed"),
-    ("08e_after_bottom_artifact_removed", "08e · Bottom Artifacts"),
+    ("07_after_baseline_cut",             "07 · Baseline Cut"),
     ("08_small_removed",                  "08 · Small Removed"),
     ("09_separated",                      "09 · Separated"),
     ("10_skeleton",                       "10 · Skeleton"),
@@ -152,6 +125,152 @@ STAGE_LABELS = [
     ("overlay_skel",                      "Overlay · Skeleton"),
 ]
 STAGE_KEYS = [k for k, _ in STAGE_LABELS]
+
+
+class _PipelineCancelled(Exception):
+    """Internal control-flow exception used to stop stale worker runs."""
+    pass
+
+PARAM_HELP = {
+    "CLAHE_CLIP_LIMIT": (
+        "Limits how aggressively CLAHE boosts local contrast inside each tile.",
+        "Increasing it from 0.5 to 2.0 usually makes faint dendrites pop more, but it also boosts SEM grain and halos.",
+        "Decreasing it from 0.5 to 0.2 keeps the image calmer, but weak thin branches can stay washed out.",
+    ),
+    "CLAHE_TILE_SIZE": (
+        "Sets how fine the CLAHE tiling is, so it controls how local the contrast enhancement becomes.",
+        "Increasing it from 8 to 16 uses more, smaller tiles and can reveal tiny local detail, but it can also make patchiness and noise more obvious.",
+        "Decreasing it from 8 to 4 makes the enhancement more global and smoother, but subtle local contrast differences can be missed.",
+    ),
+    "BILATERAL_D": (
+        "Sets the pixel neighborhood size used by the bilateral filter.",
+        "Increasing it from 9 to 15 smooths over a wider area and can suppress more grain, but it can round off thin branch edges.",
+        "Decreasing it from 9 to 5 keeps edges sharper and more local detail intact, but more SEM speckle remains.",
+    ),
+    "BILATERAL_SIGMA_COLOR": (
+        "Controls how willing the bilateral filter is to smooth across intensity differences.",
+        "Increasing it from 50 to 100 blends pixels with larger brightness gaps, which reduces noise but can blur bright dendrite boundaries.",
+        "Decreasing it from 50 to 20 preserves contrast changes more strongly, but noisy texture is less suppressed.",
+    ),
+    "BILATERAL_SIGMA_SPACE": (
+        "Controls how far the bilateral filter reaches in space around each pixel.",
+        "Increasing it from 50 to 100 makes the filter consider a broader area and smooth more broadly, but small structures can soften.",
+        "Decreasing it from 50 to 20 keeps the smoothing tight and local, but grainy regions can remain uneven.",
+    ),
+    "BILATERAL_PASSES": (
+        "Repeats the bilateral filter multiple times to accumulate denoising.",
+        "Increasing it from 1 to 3 can clean noisy SEM backgrounds better, but repeated passes can over-smooth thin branches.",
+        "Keeping it at 1 or decreasing it from 3 to 1 preserves more raw detail, but more noise reaches thresholding.",
+    ),
+    "ADAPTIVE_BLOCK_SIZE": (
+        "Sets the local window size used to compute the adaptive threshold.",
+        "Increasing it from 67 to 121 makes the threshold follow broader illumination trends, which is steadier on uneven backgrounds but less sensitive to tiny local detail.",
+        "Decreasing it from 67 to 31 makes the threshold more local and reactive, which can recover fine branches but also increases speckle and fragmentation.",
+    ),
+    "ADAPTIVE_C": (
+        "Offsets the adaptive threshold by subtracting this value from the local mean before binarization.",
+        "Increasing it from -12 toward 0 lowers the effective threshold, so more pixels become foreground and the mask usually grows noisier and thicker.",
+        "Decreasing it from -12 to -20 raises the effective threshold, so only brighter structures survive and faint branches are more likely to disappear.",
+    ),
+    "MIN_COMPONENT_AREA": (
+        "Defines the smallest connected component area that is kept after cleanup.",
+        "Increasing it from 90 to 200 removes more tiny blobs and debris, but short real branches can be dropped too.",
+        "Decreasing it from 90 to 30 keeps more small structures, but isolated noise specks are more likely to survive.",
+    ),
+    "BASELINE_DETECT_MIN_ROW_RATIO": (
+        "Defines how full a row must be to count as the dense baseline band near the bottom.",
+        "Increasing it from 0.8 to 0.9 makes baseline detection stricter, so the cut happens less often or lower in the image.",
+        "Decreasing it from 0.8 to 0.6 makes detection easier, so the lower band is removed sooner but lower dendrite trunks can get clipped.",
+    ),
+    "BASELINE_DETECT_SEARCH_START_RATIO": (
+        "Sets how far down the image the baseline search begins.",
+        "Increasing it from 0.6 to 0.75 starts the search lower, which avoids early false hits but can miss a baseline that begins higher up.",
+        "Decreasing it from 0.6 to 0.4 starts the search earlier, which can catch higher artifacts but may cut into valid lower structures.",
+    ),
+    "SMALL_TREE_BAND_HEIGHT": (
+        "Protects a band above the detected baseline so tiny components there are not removed by the area filter.",
+        "Increasing it from 30 to 60 keeps more short branches attached near the bottom, but it also preserves more debris in that band.",
+        "Decreasing it from 30 to 10 makes the cleanup stricter near the baseline, but genuine small branches in that zone can vanish.",
+    ),
+    "DISTANCE_THRESHOLD": (
+        "Controls how strong a distance-transform peak must be to become a watershed foreground marker.",
+        "Increasing it from 0.35 to 0.6 creates fewer, smaller markers, so touching branches are less likely to split apart.",
+        "Decreasing it from 0.35 to 0.2 creates broader markers, which can separate more touching structures but can also over-fragment one branch into many pieces.",
+    ),
+    "SKELETON_MIN_BRANCH_LENGTH": (
+        "Defines the minimum skeleton component size kept after pruning.",
+        "Increasing it from 8 to 20 removes more short stubs and isolated fragments, but small real side branches can be lost.",
+        "Decreasing it from 8 to 3 preserves more tiny skeleton pieces, but the result gets noisier.",
+    ),
+    "SKELETON_SPUR_LENGTH": (
+        "Sets the longest endpoint spur that will be trimmed from the skeleton.",
+        "Increasing it from 6 to 12 removes longer hooks and whiskers, but it can also shorten real terminal branches.",
+        "Decreasing it from 6 to 2 only removes the tiniest burrs, but more spiky artifacts remain.",
+    ),
+    "SKELETON_HORIZONTAL_LINE_MIN_WIDTH": (
+        "Sets how wide a near-horizontal skeleton fragment must be before it is treated as an artifact and removed.",
+        "Increasing it from 40 to 80 keeps more medium-width horizontal segments and only strips very long lines.",
+        "Decreasing it from 40 to 20 removes shorter horizontal fragments too, which can clean artifacts but may cut real lateral branches.",
+    ),
+}
+
+SKIP_HELP = {
+    "clean": (
+        "Skips the text and scale-bar cleanup stage before any enhancement runs.",
+        "Checked example: the scale bar or labels stay in the image and can be mistaken for foreground later.",
+        "Unchecked example: those overlays are removed before the rest of the pipeline starts.",
+    ),
+    "normalize": (
+        "Skips the histogram normalization step that stretches the image to the full intensity range.",
+        "Checked example: a low-contrast input stays flat and later stages have less separation to work with.",
+        "Unchecked example: the grayscale range is expanded before CLAHE and thresholding.",
+    ),
+    "clahe": (
+        "Skips local contrast enhancement with CLAHE.",
+        "Checked example: faint dendrites stay softer and some local detail may never stand out.",
+        "Unchecked example: local contrast is boosted before denoising and segmentation.",
+    ),
+    "bilateral": (
+        "Skips the edge-preserving denoising stage.",
+        "Checked example: more SEM grain reaches thresholding and the mask often gets noisier.",
+        "Unchecked example: background noise is smoothed while most strong edges stay intact.",
+    ),
+    "segmentation": (
+        "Skips threshold-based segmentation and forces an empty mask for the later stages.",
+        "Checked example: the downstream cleanup and skeleton views become empty because there is no foreground.",
+        "Unchecked example: adaptive thresholding and Otsu fallback generate the initial mask.",
+    ),
+    "baseline_cut": (
+        "Skips the cutoff that removes dense rows at the detected lower baseline.",
+        "Checked example: a bright lower band can survive and connect unrelated components.",
+        "Unchecked example: rows at and below the detected baseline are zeroed out.",
+    ),
+    "small_components": (
+        "Skips connected-component cleanup by area.",
+        "Checked example: tiny specks and fragments remain in the mask.",
+        "Unchecked example: only components above the size rule, plus the protected baseline band, are kept.",
+    ),
+    "separation": (
+        "Skips watershed-based splitting of touching branches.",
+        "Checked example: merged blobs stay connected as one piece.",
+        "Unchecked example: distance-transform markers are used to split touching structures where possible.",
+    ),
+    "skeleton": (
+        "Skips skeletonization and all skeleton pruning.",
+        "Checked example: the skeleton view becomes empty even if the mask exists.",
+        "Unchecked example: the cleaned mask is thinned to a one-pixel skeleton and pruned.",
+    ),
+}
+
+
+def _format_param_tooltip(name: str) -> str:
+    desc, inc, dec = PARAM_HELP[name]
+    return f"{desc}\nIncrease example: {inc}\nDecrease example: {dec}"
+
+
+def _format_skip_tooltip(name: str) -> str:
+    desc, checked, unchecked = SKIP_HELP[name]
+    return f"{desc}\nChecked example: {checked}\nUnchecked example: {unchecked}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,7 +291,9 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
 
     def _prog(pct: int, name: str):
         if progress_cb is not None:
-            progress_cb(pct, name)
+            keep_going = progress_cb(pct, name)
+            if keep_going is False:
+                raise _PipelineCancelled()
 
     # Stage A
     _prog(0, "Clean")
@@ -223,110 +344,23 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
     else:
         seg_mask = np.zeros_like(bilateral)
 
-    # Stage C — reconstruction
-    _prog(44, "Reconstruction")
-    if not _skip("reconstruction"):
-        ek = int(p["EROSION_KERNEL_SIZE"])
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek))
-        marker = cv2.erode(seg_mask, kernel, iterations=int(p["EROSION_ITERATIONS"]))
-        try:
-            recon_f = reconstruction((marker / 255.0).astype(np.float64),
-                                     (seg_mask / 255.0).astype(np.float64), method='dilation')
-            recon = (recon_f * 255).astype(np.uint8)
-        except Exception:
-            recon = seg_mask.copy()
-        pre = int(np.count_nonzero(seg_mask))
-        if pre > 0 and int(np.count_nonzero(recon)) / pre < float(p["RECON_MIN_KEEP_RATIO"]):
-            recon = seg_mask.copy()
-    else:
-        recon = seg_mask.copy()
-
-    _prog(54, "Baseline / Artifact Removal")
-    # baseline
-    h, _ = recon.shape
+    # Stage C — baseline cut + small component removal
+    _prog(44, "Baseline Cut")
+    h, _ = seg_mask.shape
     y_start = min(h - 1, int(round(h * float(p["BASELINE_DETECT_SEARCH_START_RATIO"]))))
-    row_ratio = np.mean(recon > 0, axis=1)
+    row_ratio = np.mean(seg_mask > 0, axis=1)
     idx = np.flatnonzero(row_ratio[y_start:] >= float(p["BASELINE_DETECT_MIN_ROW_RATIO"]))
     baseline_row = (y_start + int(idx[0])) if idx.size > 0 else None
 
-    after_baseline = recon.copy()
+    after_baseline = seg_mask.copy()
     if not _skip("baseline_cut") and baseline_row is not None:
         after_baseline[int(baseline_row):, :] = 0
 
-    # substrate
-    def _substrate(m):
-        rh = m.shape[0]
-        row_fg = np.mean(m > 0, axis=1)
-        win = max(1, int(p["SUBSTRATE_FG_WINDOW"]))
-        smooth = np.convolve(row_fg, np.ones(win) / win, mode='same')
-        thr = float(p["SUBSTRATE_ROW_FG_THRESHOLD"])
-        i2, run = rh - 1, 0
-        while i2 >= 0 and smooth[i2] >= thr:
-            run += 1; i2 -= 1
-        min_rows = max(8, int(rh * float(p["SUBSTRATE_MIN_HEIGHT_FRACTION"])))
-        if run >= min_rows:
-            cutoff = max(0, (i2 + 1) - int(p["SUBSTRATE_MARGIN_ROWS"]))
-            if baseline_row is not None:
-                cutoff = max(cutoff, max(0, int(baseline_row) - 8))
-            out = m.copy(); out[cutoff:, :] = 0; return out
-        return m
-
-    after_substrate = _substrate(after_baseline) if not _skip("substrate") else after_baseline.copy()
-
-    # top band
-    def _top_band(m):
-        rh = m.shape[0]
-        row_fg = np.mean(m > 0, axis=1)
-        run = 0
-        for i2 in range(rh):
-            if row_fg[i2] >= float(p["TOP_BAND_FG_THRESHOLD"]): run += 1
-            else: break
-        if run < int(p["TOP_BAND_MIN_ROWS"]): return m
-        cutoff = min(run, int(rh * float(p["TOP_BAND_MAX_FRACTION"])))
-        out = m.copy(); out[:cutoff, :] = 0; return out
-
-    after_top = _top_band(after_substrate) if not _skip("top_band") else after_substrate.copy()
-
-    # edge noise
-    def _edge_noise(m):
-        rh, rw = m.shape
-        max_area = int(p["EDGE_COMPONENT_MAX_AREA"])
-        n2, labels2, stats2, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-        out = m.copy()
-        for i2 in range(1, n2):
-            x2 = stats2[i2, cv2.CC_STAT_LEFT]; cw2 = stats2[i2, cv2.CC_STAT_WIDTH]
-            ch2 = stats2[i2, cv2.CC_STAT_HEIGHT]; area2 = stats2[i2, cv2.CC_STAT_AREA]
-            if area2 <= max_area and (x2 <= 1 or x2 + cw2 >= rw - 1):
-                if cw2 <= max(12, int(rw * 0.015)) and ch2 <= max(20, int(rh * 0.05)):
-                    out[labels2 == i2] = 0
-        return out
-
-    after_edge = _edge_noise(after_top) if not _skip("edge_noise") else after_top.copy()
-
-    # bottom artifacts
-    def _bottom_arts(m):
-        rh, rw = m.shape
-        n2, labels2, stats2, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
-        out = m.copy()
-        for i2 in range(1, n2):
-            x2 = stats2[i2, cv2.CC_STAT_LEFT]; y2 = stats2[i2, cv2.CC_STAT_TOP]
-            cw2 = stats2[i2, cv2.CC_STAT_WIDTH]; ch2 = stats2[i2, cv2.CC_STAT_HEIGHT]
-            near_bot = y2 >= int(rh * 0.5); lower = y2 >= int(rh * 0.65)
-            spans = x2 <= 1 and x2 + cw2 >= rw - 1
-            thin_h = ch2 <= 4 and cw2 >= int(rw * 0.60)
-            stub = ch2 <= 3 and cw2 >= 20
-            if near_bot and (spans or thin_h or (lower and stub)):
-                out[labels2 == i2] = 0
-        return out
-
-    after_bottom = _bottom_arts(after_edge) if not _skip("bottom_artifacts") else after_edge.copy()
-
-    _prog(68, "Small Component Removal")
-    # small components
+    _prog(58, "Small Component Removal")
     if not _skip("small_components"):
         min_area = int(p["MIN_COMPONENT_AREA"])
-        n2, labels2, stats2, _ = cv2.connectedComponentsWithStats(after_bottom, connectivity=8)
-        cleaned_mask = np.zeros_like(after_bottom)
+        n2, labels2, stats2, _ = cv2.connectedComponentsWithStats(after_baseline, connectivity=8)
+        cleaned_mask = np.zeros_like(after_baseline)
         band_top = max(0, int(baseline_row) - int(p["SMALL_TREE_BAND_HEIGHT"])) if baseline_row is not None else None
         for i2 in range(1, n2):
             area2 = int(stats2[i2, cv2.CC_STAT_AREA])
@@ -337,7 +371,7 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
             if area2 >= min_area:
                 cleaned_mask[labels2 == i2] = 255
     else:
-        cleaned_mask = after_bottom.copy()
+        cleaned_mask = after_baseline.copy()
 
     # Stage D
     _prog(78, "Branch Separation")
@@ -412,12 +446,7 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
         "04_clahe": clahe_img,
         "05_bilateral": bilateral,
         "06_segmented": seg_mask,
-        "07_reconstructed": recon,
-        "08a_after_baseline_cut": after_baseline,
-        "08b_after_substrate_removed": after_substrate,
-        "08c_after_top_removed": after_top,
-        "08d_after_edge_removed": after_edge,
-        "08e_after_bottom_artifact_removed": after_bottom,
+        "07_after_baseline_cut": after_baseline,
         "08_small_removed": cleaned_mask,
         "09_separated": separated,
         "10_skeleton": skeleton,
@@ -434,6 +463,64 @@ def _to_bgr(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     return img
+
+
+def _as_uint8(img: np.ndarray) -> np.ndarray:
+    if img.dtype == np.uint8:
+        return img
+    if img.dtype == np.bool_:
+        return img.astype(np.uint8) * 255
+    if np.issubdtype(img.dtype, np.floating):
+        if img.size and np.nanmax(img) <= 1.0 and np.nanmin(img) >= 0.0:
+            return np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        return np.clip(img, 0, 255).astype(np.uint8)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _hex_to_bgr(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    if len(color) != 6:
+        return (64, 64, 255)
+    r = int(color[0:2], 16)
+    g = int(color[2:4], 16)
+    b = int(color[4:6], 16)
+    return (b, g, r)
+
+
+def _difference_mask(img_a: np.ndarray, img_b: np.ndarray,
+                     threshold: int = 12) -> np.ndarray | None:
+    if img_a is None or img_b is None:
+        return None
+
+    a = _to_bgr(_as_uint8(img_a))
+    b = _to_bgr(_as_uint8(img_b))
+    if b.shape[:2] != a.shape[:2]:
+        b = cv2.resize(b, (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+    diff = cv2.absdiff(a, b)
+    mask = (diff.max(axis=2) >= threshold).astype(np.uint8) * 255
+    if not np.any(mask):
+        return mask
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    return cv2.dilate(mask, kernel, iterations=1)
+
+
+def _highlight_differences(img: np.ndarray, compare_img: np.ndarray,
+                           highlight_color: tuple[int, int, int]) -> np.ndarray:
+    base = _to_bgr(_as_uint8(img))
+    mask = _difference_mask(img, compare_img)
+    if mask is None or not np.any(mask):
+        return base
+
+    solid = np.full_like(base, highlight_color)
+    blended = cv2.addWeighted(base, 0.55, solid, 0.45, 0)
+    out = base.copy()
+    out[mask > 0] = blended[mask > 0]
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(out, contours, -1, highlight_color, 1, cv2.LINE_AA)
+    return out
 
 
 def _make_thumb(img: np.ndarray, tw: int, th: int) -> np.ndarray:
@@ -464,7 +551,9 @@ def _np_to_pixmap(img: np.ndarray, w: int, h: int) -> QPixmap:
 
 
 def _build_grid_canvas(results: dict, cols: int = 4,
-                       cell_w: int = 320, cell_h: int = 260) -> np.ndarray:
+                       cell_w: int = 320, cell_h: int = 260,
+                       compare_results: dict | None = None,
+                       highlight_color: tuple[int, int, int] | None = None) -> np.ndarray:
     keys = [k for k in STAGE_KEYS if k in results]
     rows = (len(keys) + cols - 1) // cols
     label_h, pad = 20, 4
@@ -476,7 +565,10 @@ def _build_grid_canvas(results: dict, cols: int = 4,
         r, c = divmod(idx, cols)
         x0 = pad + c * (cell_w + pad)
         y0 = pad + r * (cell_h + label_h + pad)
-        canvas[y0:y0 + cell_h, x0:x0 + cell_w] = _make_thumb(results[key], cell_w, cell_h)
+        img = results[key]
+        if compare_results is not None and highlight_color is not None:
+            img = _highlight_differences(img, compare_results.get(key), highlight_color)
+        canvas[y0:y0 + cell_h, x0:x0 + cell_w] = _make_thumb(img, cell_w, cell_h)
         lbl = next((l for k2, l in STAGE_LABELS if k2 == key), key)
         cv2.putText(canvas, lbl, (x0 + 2, y0 + cell_h + label_h - 4),
                     font, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
@@ -490,7 +582,7 @@ def _build_grid_canvas(results: dict, cols: int = 4,
 class PipelineWorker(QThread):
     """Runs _run_pipeline on a background thread; emits Qt signals for progress."""
     progress   = pyqtSignal(int, str)   # (percent 0-100, stage name)
-    finished   = pyqtSignal(str, dict)  # (slot "a"/"b", results dict)
+    result_ready = pyqtSignal(str, dict)  # (slot "a"/"b", results dict)
     error      = pyqtSignal(str, str)   # (slot, error message)
 
     def __init__(self, slot: str, image: np.ndarray, params: dict, skips: dict):
@@ -506,13 +598,17 @@ class PipelineWorker(QThread):
 
     def run(self):
         def _cb(pct: int, name: str):
-            if not self._cancelled:
-                self.progress.emit(pct, name)
+            if self._cancelled:
+                return False
+            self.progress.emit(pct, name)
+            return True
 
         try:
             results = _run_pipeline(self.image, self.params, self.skips, _cb)
             if not self._cancelled:
-                self.finished.emit(self.slot, results)
+                self.result_ready.emit(self.slot, results)
+        except _PipelineCancelled:
+            pass
         except Exception as e:
             if not self._cancelled:
                 self.error.emit(self.slot, f"{e}\n{traceback.format_exc()}")
@@ -525,7 +621,7 @@ class PipelineWorker(QThread):
 class ParamRow(QWidget):
     value_changed = pyqtSignal(str, object)
 
-    def __init__(self, name, default, lo, hi, step, is_float=False, parent=None):
+    def __init__(self, name, default, lo, hi, step, is_float=False, tooltip="", parent=None):
         super().__init__(parent)
         self.name = name
         lay = QHBoxLayout(self)
@@ -533,7 +629,7 @@ class ParamRow(QWidget):
 
         lbl = QLabel(name)
         lbl.setFixedWidth(240)
-        lbl.setToolTip(name)
+        lbl.setToolTip(tooltip or name)
         lay.addWidget(lbl)
 
         if is_float:
@@ -548,14 +644,19 @@ class ParamRow(QWidget):
         self.spin.setMaximum(hi)
         self.spin.setValue(default)
         self.spin.setFixedWidth(90)
+        self.spin.setToolTip(tooltip or name)
         lay.addWidget(self.spin)
 
         rst = QPushButton("↺")
         rst.setFixedWidth(26)
-        rst.setToolTip(f"Reset to {default}")
+        rst_tip = f"Reset to {default}"
+        if tooltip:
+            rst_tip = f"{tooltip}\n{rst_tip}"
+        rst.setToolTip(rst_tip)
         rst.clicked.connect(lambda: self.spin.setValue(default))
         lay.addWidget(rst)
 
+        self.setToolTip(tooltip or name)
         self.spin.valueChanged.connect(lambda v: self.value_changed.emit(self.name, v))
 
     def get_value(self):
@@ -605,6 +706,7 @@ class ParamPanel(QScrollArea):
                     cb = QCheckBox(skip_label)
                     cb.setChecked(False)
                     cb.setStyleSheet("color: #f38ba8; font-style: italic;")
+                    cb.setToolTip(_format_skip_tooltip(skip_key))
                     cb.stateChanged.connect(self._emit_changed)
                     self._skip_cbs[skip_key] = cb
                     group_lay.addWidget(cb)
@@ -615,7 +717,15 @@ class ParamPanel(QScrollArea):
                     line.setStyleSheet("color: #45475a;")
                     group_lay.addWidget(line)
 
-            row = ParamRow(name, DEFAULTS[name], lo, hi, step, is_float)
+            row = ParamRow(
+                name,
+                DEFAULTS[name],
+                lo,
+                hi,
+                step,
+                is_float,
+                tooltip=_format_param_tooltip(name),
+            )
             row.value_changed.connect(self._emit_changed)
             self._rows[name] = row
             group_lay.addWidget(row)
@@ -631,6 +741,12 @@ class ParamPanel(QScrollArea):
 
     def get_skips(self) -> dict:
         return {key: cb.isChecked() for key, cb in self._skip_cbs.items()}
+
+    def get_state(self) -> dict:
+        return {
+            "params": self.get_params(),
+            "skips": self.get_skips(),
+        }
 
     def set_params(self, params: dict):
         for name, row in self._rows.items():
@@ -651,6 +767,10 @@ class ParamPanel(QScrollArea):
             cb.setChecked(False)
             cb.blockSignals(False)
 
+    def apply_state(self, state: dict):
+        self.set_params(state.get("params", {}))
+        self.set_skips(state.get("skips", {}))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ImagePane — a display pane for one result set
@@ -662,6 +782,7 @@ class ImagePane(QWidget):
     def __init__(self, label_text: str, label_color: str, parent=None):
         super().__init__(parent)
         self._accent = label_color
+        self._accent_bgr = _hex_to_bgr(label_color)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(2)
@@ -739,7 +860,7 @@ class ImagePane(QWidget):
     def set_results(self, results: dict):
         self.results = results
 
-    def refresh(self, mode: str, stage_key: str):
+    def refresh(self, mode: str, stage_key: str, compare_results: dict | None = None):
         if not self.results:
             return
         vw = self.scroll.viewport().width() - 4
@@ -751,9 +872,15 @@ class ImagePane(QWidget):
             img = self.results.get(stage_key)
             if img is None:
                 return
+            if compare_results is not None:
+                img = _highlight_differences(img, compare_results.get(stage_key), self._accent_bgr)
             pix = _np_to_pixmap(img, vw, vh)
         else:
-            canvas = _build_grid_canvas(self.results)
+            canvas = _build_grid_canvas(
+                self.results,
+                compare_results=compare_results,
+                highlight_color=self._accent_bgr if compare_results is not None else None,
+            )
             scale = min(vw / canvas.shape[1], vh / canvas.shape[0], 1.0)
             if scale < 1.0:
                 nw = max(1, int(canvas.shape[1] * scale))
@@ -789,6 +916,8 @@ class MainWindow(QMainWindow):
         self._compare_mode = False
         self._worker_a: PipelineWorker | None = None
         self._worker_b: PipelineWorker | None = None
+        self._pending_rerun = {"a": False, "b": False}
+        self._close_requested = False
 
         # Two independent debounce timers — one per slot
         self._timer_a = QTimer(); self._timer_a.setSingleShot(True)
@@ -835,6 +964,12 @@ class MainWindow(QMainWindow):
         self.compare_btn.toggled.connect(self._toggle_compare)
         left_lay.addWidget(self.compare_btn)
 
+        self.highlight_diff_cb = QCheckBox("Highlight differences")
+        self.highlight_diff_cb.setChecked(True)
+        self.highlight_diff_cb.setEnabled(False)
+        self.highlight_diff_cb.toggled.connect(self._refresh_display)
+        left_lay.addWidget(self.highlight_diff_cb)
+
         # Tabs
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.North)
@@ -848,9 +983,16 @@ class MainWindow(QMainWindow):
         btns_a = QHBoxLayout()
         reset_a = QPushButton("↺ Reset A")
         reset_a.clicked.connect(lambda: self._reset_slot("a"))
+        save_a = QPushButton("Save A…")
+        save_a.clicked.connect(lambda: self._save_slot_preset("a"))
+        load_a = QPushButton("Load A…")
+        load_a.clicked.connect(lambda: self._load_slot_preset("a"))
         copy_to_b = QPushButton("Copy A → B")
         copy_to_b.clicked.connect(self._copy_a_to_b)
-        btns_a.addWidget(reset_a); btns_a.addWidget(copy_to_b)
+        btns_a.addWidget(reset_a)
+        btns_a.addWidget(save_a)
+        btns_a.addWidget(load_a)
+        btns_a.addWidget(copy_to_b)
         tab_a_lay.addLayout(btns_a)
 
         self.live_cb = QCheckBox("Live update")
@@ -875,9 +1017,16 @@ class MainWindow(QMainWindow):
         btns_b = QHBoxLayout()
         reset_b = QPushButton("↺ Reset B")
         reset_b.clicked.connect(lambda: self._reset_slot("b"))
+        save_b = QPushButton("Save B…")
+        save_b.clicked.connect(lambda: self._save_slot_preset("b"))
+        load_b = QPushButton("Load B…")
+        load_b.clicked.connect(lambda: self._load_slot_preset("b"))
         copy_to_a = QPushButton("Copy B → A")
         copy_to_a.clicked.connect(self._copy_b_to_a)
-        btns_b.addWidget(reset_b); btns_b.addWidget(copy_to_a)
+        btns_b.addWidget(reset_b)
+        btns_b.addWidget(save_b)
+        btns_b.addWidget(load_b)
+        btns_b.addWidget(copy_to_a)
         tab_b_lay.addLayout(btns_b)
 
         run_b = QPushButton("▶  Run B")
@@ -939,6 +1088,7 @@ class MainWindow(QMainWindow):
     def _toggle_compare(self, on: bool):
         self._compare_mode = on
         self.pane_b.setVisible(on)
+        self.highlight_diff_cb.setEnabled(on)
         self.compare_btn.setText(
             "✖  Disable Compare" if on else "⚡  Enable Compare A vs B"
         )
@@ -953,54 +1103,60 @@ class MainWindow(QMainWindow):
             self._schedule(slot, 250)
 
     def _schedule(self, slot: str, delay: int):
+        if self._close_requested:
+            return
         if slot == "a":
             self._timer_a.start(delay)
         else:
             self._timer_b.start(delay)
 
     def _run_slot(self, slot: str):
-        if self.image is None:
+        if self.image is None or self._close_requested:
             return
-
-        # Cancel any existing worker for this slot
-        if slot == "a":
-            if self._worker_a is not None:
-                self._worker_a.cancel()
-                self._worker_a.quit()
-                self._worker_a = None
-        else:
-            if self._worker_b is not None:
-                self._worker_b.cancel()
-                self._worker_b.quit()
-                self._worker_b = None
 
         panel = self.panel_a if slot == "a" else self.panel_b
         pane  = self.pane_a  if slot == "a" else self.pane_b
+        current_worker = self._worker_a if slot == "a" else self._worker_b
+
+        # Never destroy an in-flight QThread. Mark it stale and queue one rerun.
+        if current_worker is not None:
+            if current_worker.isRunning():
+                current_worker.cancel()
+                self._pending_rerun[slot] = True
+                pane.set_running(True)
+                pane.stage_label.setText("Updating…")
+                self.status_label.setText(f"Updating {slot.upper()}…")
+                return
+            if slot == "a":
+                self._worker_a = None
+            else:
+                self._worker_b = None
+
         worker = PipelineWorker(slot, self.image, panel.get_params(), panel.get_skips())
 
         worker.progress.connect(lambda pct, name, p=pane: p.set_progress(pct, name))
-        worker.finished.connect(self._on_worker_finished)
+        worker.result_ready.connect(self._on_worker_result)
         worker.error.connect(self._on_worker_error)
+        worker.finished.connect(lambda s=slot, w=worker: self._on_worker_thread_finished(s, w))
 
         if slot == "a":
             self._worker_a = worker
         else:
             self._worker_b = worker
 
+        self._pending_rerun[slot] = False
         pane.set_running(True)
         self.status_label.setText(f"Running {slot.upper()}…")
         worker.start()
 
-    def _on_worker_finished(self, slot: str, results: dict):
+    def _on_worker_result(self, slot: str, results: dict):
         pane = self.pane_a if slot == "a" else self.pane_b
         pane.set_done()
         pane.set_results(results)
         if slot == "a":
             self._results_a = results
-            self._worker_a = None
         else:
             self._results_b = results
-            self._worker_b = None
         self.status_label.setText("Done ✓")
         self._refresh_display()
 
@@ -1008,12 +1164,33 @@ class MainWindow(QMainWindow):
         pane = self.pane_a if slot == "a" else self.pane_b
         pane.set_running(False)
         pane.stage_label.setText("Error")
-        if slot == "a":
-            self._worker_a = None
-        else:
-            self._worker_b = None
         self.status_label.setText(f"Error ({slot.upper()}) — see console")
         print(f"[Pipeline error — slot {slot.upper()}]\n{msg}")
+
+    def _on_worker_thread_finished(self, slot: str, worker: PipelineWorker):
+        current_worker = self._worker_a if slot == "a" else self._worker_b
+        if current_worker is worker:
+            if slot == "a":
+                self._worker_a = None
+            else:
+                self._worker_b = None
+
+        worker.deleteLater()
+
+        if self._close_requested:
+            if not self._has_running_workers():
+                self.close()
+            return
+
+        if self._pending_rerun[slot] and self.image is not None:
+            self._pending_rerun[slot] = False
+            self._run_slot(slot)
+
+    def _has_running_workers(self) -> bool:
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (self._worker_a, self._worker_b)
+        )
 
     def _reset_slot(self, slot: str):
         panel = self.panel_a if slot == "a" else self.panel_b
@@ -1029,6 +1206,96 @@ class MainWindow(QMainWindow):
         self.panel_a.set_params(self.panel_b.get_params())
         self.panel_a.set_skips(self.panel_b.get_skips())
         self._schedule("a", 0)
+
+    def _slot_panel(self, slot: str) -> ParamPanel:
+        return self.panel_a if slot == "a" else self.panel_b
+
+    def _default_preset_path(self, slot: str) -> str:
+        return os.path.join(os.path.dirname(__file__), f"pipeline_gui_preset_{slot}.json")
+
+    def _preset_payload(self, slot: str) -> dict:
+        panel = self._slot_panel(slot)
+        return {
+            "schema_version": 1,
+            "slot": slot,
+            "params": panel.get_params(),
+            "skips": panel.get_skips(),
+        }
+
+    def _validate_preset_payload(self, payload: dict) -> tuple[dict, str | None]:
+        if not isinstance(payload, dict):
+            return {}, "Preset file must contain a JSON object."
+
+        params = payload.get("params")
+        skips = payload.get("skips")
+        if not isinstance(params, dict):
+            return {}, "Preset is missing a valid 'params' object."
+        if not isinstance(skips, dict):
+            return {}, "Preset is missing a valid 'skips' object."
+
+        clean_params = {}
+        for name in DEFAULTS:
+            if name not in params:
+                continue
+            value = params[name]
+            if not isinstance(value, (int, float)):
+                return {}, f"Invalid value for parameter '{name}'."
+            clean_params[name] = value
+
+        clean_skips = {}
+        known_skip_keys = {key for key, _, _ in SKIP_SPECS}
+        for key, value in skips.items():
+            if key not in known_skip_keys:
+                continue
+            if not isinstance(value, bool):
+                return {}, f"Invalid value for skip flag '{key}'."
+            clean_skips[key] = value
+
+        return {"params": clean_params, "skips": clean_skips}, None
+
+    def _save_slot_preset(self, slot: str):
+        suggested = self._default_preset_path(slot)
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"Save Preset for {slot.upper()}",
+            suggested,
+            "JSON Files (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._preset_payload(slot), f, indent=2, sort_keys=True)
+            self.status_label.setText(f"Saved preset {os.path.basename(path)}")
+        except Exception as e:
+            self.status_label.setText(f"Save failed: {e}")
+
+    def _load_slot_preset(self, slot: str):
+        suggested = self._default_preset_path(slot)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Load Preset into {slot.upper()}",
+            suggested,
+            "JSON Files (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            state, err = self._validate_preset_payload(payload)
+            if err is not None:
+                self.status_label.setText(f"Load failed: {err}")
+                return
+            self._slot_panel(slot).apply_state(state)
+            self.status_label.setText(f"Loaded preset {os.path.basename(path)} into {slot.upper()}")
+            self._schedule(slot, 0)
+        except Exception as e:
+            self.status_label.setText(f"Load failed: {e}")
 
     # ── Image loading ─────────────────────────────────────────────────────────
 
@@ -1056,14 +1323,43 @@ class MainWindow(QMainWindow):
     def _refresh_display(self):
         mode = "single" if self.view_mode.currentText() == "Single stage" else "grid"
         stage_key = self.stage_combo.currentData()
+        highlight_diffs = self._compare_mode and self.highlight_diff_cb.isChecked()
 
-        self.pane_a.refresh(mode, stage_key)
+        self.pane_a.refresh(
+            mode,
+            stage_key,
+            compare_results=self._results_b if highlight_diffs else None,
+        )
         if self._compare_mode:
-            self.pane_b.refresh(mode, stage_key)
+            self.pane_b.refresh(
+                mode,
+                stage_key,
+                compare_results=self._results_a if highlight_diffs else None,
+            )
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_display()
+
+    def closeEvent(self, event):
+        self._timer_a.stop()
+        self._timer_b.stop()
+        self._pending_rerun["a"] = False
+        self._pending_rerun["b"] = False
+
+        active = []
+        for worker in (self._worker_a, self._worker_b):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                active.append(worker)
+
+        if active:
+            self._close_requested = True
+            self.status_label.setText("Stopping pipeline threads…")
+            event.ignore()
+            return
+
+        super().closeEvent(event)
 
     # ── Dark theme ────────────────────────────────────────────────────────────
 
