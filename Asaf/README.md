@@ -74,7 +74,7 @@ Uses YOLOv11 instance segmentation with transfer learning from COCO pretrained w
 Using the generic pipeline script:
 
 ```bash
-python yolo_pipeline.py train --data <path/to/data.yaml> [--epochs 100] [--model yolo11x-seg.pt]
+python yolo_pipeline.py train --data <path/to/data.yaml> [--epochs 100] [--model yolo11n-seg.pt]
 ```
 
 ### Inference
