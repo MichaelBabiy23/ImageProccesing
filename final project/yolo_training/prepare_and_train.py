@@ -366,6 +366,7 @@ def train(
 # ===========================================================================
 
 def parse_args():
+    """Parse CLI arguments for dataset preparation and YOLO training."""
     p = argparse.ArgumentParser(
         description="Prepare dataset from raw/ and train YOLO-seg dendrite model",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -394,6 +395,7 @@ def parse_args():
 
 
 def main():
+    """Entry point: prepare dataset from raw data, then optionally train YOLO."""
     args = parse_args()
 
     train_f, val_f, test_f = args.splits

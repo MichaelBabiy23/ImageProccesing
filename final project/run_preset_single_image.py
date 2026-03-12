@@ -1,6 +1,14 @@
 """
-Run a pipeline_gui preset on one image and stitch every stage beside
-the corresponding classic output.
+Apply a pipeline_gui preset to a single SEM image and compare with classic output.
+
+Reads a JSON preset (exported from pipeline_gui.py) containing all tunable
+parameters and skip flags, runs the full classic pipeline with those settings
+on one image, saves every intermediate stage, and stitches each stage
+side-by-side against the existing classic pipeline output for visual comparison.
+
+Usage:
+    python run_preset_single_image.py --image data/raw/Easy/img.tif --category Easy
+    python run_preset_single_image.py --image img.tif --category Hard --preset my_preset.json
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ from utils import clean_sem_image, create_comparison_strip, create_overlay, load
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for preset pipeline execution."""
     project_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Run one preset image and stitch it against classic output.")
     parser.add_argument("--image", required=True, help="Input image path")
@@ -43,6 +52,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_preset_pipeline(image: np.ndarray, params: dict, skips: dict) -> dict[str, np.ndarray]:
+    """
+    Run the full classic pipeline using preset parameters and skip flags.
+
+    Mirrors the stages in classic_pipeline.py but uses parameter values from
+    a GUI-exported JSON preset instead of the module-level constants. Each
+    stage can be individually skipped via the skips dict.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Raw grayscale SEM image (H, W).
+    params : dict
+        Pipeline parameter values (e.g. CLAHE_CLIP_LIMIT, ADAPTIVE_BLOCK_SIZE).
+    skips : dict
+        Boolean flags keyed by stage name (e.g. 'clean', 'clahe', 'bilateral').
+
+    Returns
+    -------
+    intermediates : dict of str to np.ndarray
+        All intermediate images keyed by stage name (01_original through
+        10_skeleton plus overlay images).
+    """
     def skip(name: str) -> bool:
         return bool(skips.get(name, False))
 
@@ -247,6 +278,7 @@ def run_preset_pipeline(image: np.ndarray, params: dict, skips: dict) -> dict[st
 
 
 def main() -> int:
+    """Load preset, run pipeline on one image, save stages and comparison strips."""
     args = parse_args()
     image_path = Path(args.image).resolve()
     output_root = Path(args.output_root).resolve()

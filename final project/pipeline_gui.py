@@ -74,6 +74,7 @@ _DEFAULT_PARAM_NAMES = (
 
 DEFAULTS = {name: getattr(classic_cfg, name) for name in _DEFAULT_PARAM_NAMES}
 
+# Each spec: (name, lo, hi, step, is_float, group_label)
 PARAM_SPECS = [
     # (name, lo, hi, step, is_float, group)
     ("CLAHE_CLIP_LIMIT",          0.1, 40.0,  0.1,  True,  "Stage A · Pre-processing"),
@@ -94,6 +95,7 @@ PARAM_SPECS = [
     ("SKELETON_HORIZONTAL_LINE_MIN_WIDTH", 1, 500, 5, False, "Skeleton"),
 ]
 
+# Each spec: (internal_key, checkbox_label, group_label)
 SKIP_SPECS = [
     ("clean",            "Skip: Clean (text/scale-bar removal)",  "Stage A · Pre-processing"),
     ("normalize",        "Skip: Histogram normalisation",          "Stage A · Pre-processing"),
@@ -106,10 +108,12 @@ SKIP_SPECS = [
     ("skeleton",         "Skip: Skeletonisation",                  "Skeleton"),
 ]
 
+# Group skip specs by their pipeline stage for layout purposes
 _SKIP_BY_GROUP: dict[str, list] = {}
 for _sk, _sl, _sg in SKIP_SPECS:
     _SKIP_BY_GROUP.setdefault(_sg, []).append((_sk, _sl))
 
+# Ordered list of pipeline stage keys and their human-readable labels
 STAGE_LABELS = [
     ("01_original",                       "01 · Original"),
     ("02_cleaned",                        "02 · Cleaned"),
@@ -280,8 +284,41 @@ def _format_skip_tooltip(name: str) -> str:
 def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
                   progress_cb=None) -> dict:
     """
-    progress_cb: callable(pct: int, stage_name: str) or None.
-    Called at the start of each named stage so the UI can update a progress bar.
+    Execute the full classic SEM dendrite segmentation pipeline.
+
+    Runs each stage sequentially (clean, normalize, CLAHE, bilateral,
+    segment, baseline cut, small-component removal, watershed separation,
+    skeletonisation) and collects every intermediate result so the GUI
+    can display them individually or in a grid.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Grayscale SEM input image (uint8, single-channel).
+    p : dict
+        Pipeline parameters keyed by ``PARAM_SPECS`` names (e.g.
+        ``"CLAHE_CLIP_LIMIT"``, ``"ADAPTIVE_BLOCK_SIZE"``).
+    skips : dict or None
+        Boolean flags keyed by stage shorthand (e.g. ``"clahe": True``)
+        indicating which stages to bypass.  A skipped stage passes its
+        input through unchanged (or produces an empty mask for
+        segmentation).
+    progress_cb : callable(pct: int, stage_name: str) -> bool, optional
+        Invoked at the start of each named stage so the UI can update a
+        progress bar.  Must return ``True`` to continue or ``False`` to
+        cancel the run (raises ``_PipelineCancelled``).
+
+    Returns
+    -------
+    dict
+        Mapping of stage keys (e.g. ``"01_original"``, ``"06_segmented"``,
+        ``"overlay_mask"``) to their corresponding ``np.ndarray`` images.
+
+    Raises
+    ------
+    _PipelineCancelled
+        If *progress_cb* returns ``False``, indicating the run is stale
+        and should be abandoned.
     """
     if skips is None:
         skips = {}
@@ -295,7 +332,7 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
             if keep_going is False:
                 raise _PipelineCancelled()
 
-    # Stage A
+    # ── Stage A: Pre-processing ──────────────────────────────────────────
     _prog(0, "Clean")
     cleaned = clean_sem_image(image) if not _skip("clean") else image.copy()
 
@@ -324,13 +361,16 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
     else:
         bilateral = clahe_img.copy()
 
-    # Stage B
+    # ── Stage B: Segmentation ────────────────────────────────────────────
     _prog(32, "Segmentation")
+    # Ensure block size is odd and >= 3 (OpenCV requirement for adaptive threshold)
     block = max(3, int(p["ADAPTIVE_BLOCK_SIZE"]) | 1)
     adaptive = cv2.adaptiveThreshold(bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                      cv2.THRESH_BINARY, block, float(p["ADAPTIVE_C"]))
     _, otsu = cv2.threshold(bilateral, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    # Normalise polarity: ensure foreground (dendrites) is white.
+    # If more than half the pixels are white, invert the mask.
     def _norm_pol(m):
         return cv2.bitwise_not(m) if np.sum(m > 0) / m.size > 0.5 else m
 
@@ -338,15 +378,20 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
     otsu = _norm_pol(otsu)
 
     if not _skip("segmentation"):
+        # Use the top 80% of the image to estimate foreground ratio,
+        # then pick adaptive thresholding unless it produces an
+        # unreasonable amount of foreground (fall back to Otsu).
         top = adaptive[:max(1, int(adaptive.shape[0] * 0.8)), :]
         a_fg = np.sum(top > 0) / top.size
         seg_mask = adaptive if 0.01 <= a_fg <= 0.55 else otsu
     else:
         seg_mask = np.zeros_like(bilateral)
 
-    # Stage C — baseline cut + small component removal
+    # ── Stage C: Baseline cut + small component removal ──────────────────
     _prog(44, "Baseline Cut")
     h, _ = seg_mask.shape
+    # Scan rows from the search-start ratio downward looking for the
+    # first row where the foreground fraction exceeds the threshold.
     y_start = min(h - 1, int(round(h * float(p["BASELINE_DETECT_SEARCH_START_RATIO"]))))
     row_ratio = np.mean(seg_mask > 0, axis=1)
     idx = np.flatnonzero(row_ratio[y_start:] >= float(p["BASELINE_DETECT_MIN_ROW_RATIO"]))
@@ -361,6 +406,7 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
         min_area = int(p["MIN_COMPONENT_AREA"])
         n2, labels2, stats2, _ = cv2.connectedComponentsWithStats(after_baseline, connectivity=8)
         cleaned_mask = np.zeros_like(after_baseline)
+        # Components touching the baseline band are kept regardless of size
         band_top = max(0, int(baseline_row) - int(p["SMALL_TREE_BAND_HEIGHT"])) if baseline_row is not None else None
         for i2 in range(1, n2):
             area2 = int(stats2[i2, cv2.CC_STAT_AREA])
@@ -373,28 +419,33 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
     else:
         cleaned_mask = after_baseline.copy()
 
-    # Stage D
+    # ── Stage D: Watershed branch separation ─────────────────────────────
     _prog(78, "Branch Separation")
     if not _skip("separation") and np.sum(cleaned_mask) > 0:
         dist = cv2.distanceTransform(cleaned_mask, cv2.DIST_L2, 5)
+        # Threshold the distance map to find sure-foreground markers
         _, sure_fg = cv2.threshold(dist, float(p["DISTANCE_THRESHOLD"]) * dist.max(), 255, cv2.THRESH_BINARY)
         sure_fg = sure_fg.astype(np.uint8)
         sure_bg = cv2.dilate(cleaned_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=3)
         unknown = cv2.subtract(sure_bg, sure_fg)
         _, markers = cv2.connectedComponents(sure_fg)
+        # Offset markers by 1 so background=1, unknown=0 (watershed convention)
         markers = markers + 1; markers[unknown == 255] = 0
         markers = cv2.watershed(cv2.cvtColor(cleaned_mask, cv2.COLOR_GRAY2BGR), markers)
+        # Watershed boundaries are marked as -1; zero them out in the output
         separated = cleaned_mask.copy(); separated[markers == -1] = 0
     else:
         separated = cleaned_mask.copy()
 
+    # ── Skeletonisation + pruning ────────────────────────────────────────
     _prog(88, "Skeletonisation")
     # Skeleton
     if not _skip("skeleton"):
+        # Morphological closing before thinning to reduce fragmentation
         smoothed = cv2.morphologyEx(separated, cv2.MORPH_CLOSE,
                                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         skeleton = skeletonize((smoothed > 0).astype(bool)).astype(np.uint8) * 255
-        # prune
+        # Prune small components and near-horizontal artifact lines
         min_branch = int(p["SKELETON_MIN_BRANCH_LENGTH"])
         horiz_min = int(p["SKELETON_HORIZONTAL_LINE_MIN_WIDTH"])
         n2, labels2, stats2, _ = cv2.connectedComponentsWithStats(skeleton, connectivity=8)
@@ -402,17 +453,21 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
             sw = stats2[i2, cv2.CC_STAT_WIDTH]; sh = stats2[i2, cv2.CC_STAT_HEIGHT]
             if stats2[i2, cv2.CC_STAT_AREA] < min_branch or (sh <= 3 and sw >= horiz_min):
                 skeleton[labels2 == i2] = 0
-        # spurs
+        # Iterative spur removal: trace from each endpoint and remove
+        # short dead-end paths that are shorter than spur_len pixels
         spur_len = int(p["SKELETON_SPUR_LENGTH"])
         nb_k = np.array([[1,1,1],[1,0,1],[1,1,1]], dtype=np.uint8)
         for _ in range(5):
             b2 = (skeleton > 0).astype(np.uint8)
+            # Count 8-connected neighbours for each skeleton pixel
             nbc = cv2.filter2D(b2, cv2.CV_16S, nb_k).astype(np.int16)
+            # Endpoints have exactly one neighbour
             ep_coords = list(zip(*np.where((b2 == 1) & (nbc == 1))))
             if not ep_coords: break
             removed = False
             for r2, c2 in ep_coords:
                 if skeleton[r2, c2] == 0: continue
+                # Walk the spur path from endpoint until a junction (>=3 neighbours)
                 path = [(r2, c2)]; cr2, cc2 = r2, c2; visited = {(cr2, cc2)}
                 while True:
                     found = False
@@ -434,6 +489,7 @@ def _run_pipeline(image: np.ndarray, p: dict, skips: dict | None = None,
     else:
         skeleton = np.zeros_like(separated)
 
+    # ── Generate overlay visualisations ──────────────────────────────────
     _prog(96, "Overlays")
     overlay_mask = create_overlay(image, separated, color=(0, 255, 0), alpha=0.55)
     overlay_skel = create_overlay(image, skeleton, color=(0, 0, 255), alpha=0.70)
@@ -489,6 +545,27 @@ def _hex_to_bgr(color: str) -> tuple[int, int, int]:
 
 def _difference_mask(img_a: np.ndarray, img_b: np.ndarray,
                      threshold: int = 12) -> np.ndarray | None:
+    """
+    Compute a binary mask of pixels that differ between two images.
+
+    Both images are converted to BGR uint8 before comparison.  Pixels
+    whose maximum per-channel absolute difference exceeds *threshold*
+    are marked as changed.  The resulting mask is dilated by one pixel
+    to make small differences more visible in the overlay.
+
+    Parameters
+    ----------
+    img_a, img_b : np.ndarray
+        The two images to compare (any dtype/channel count accepted).
+    threshold : int
+        Minimum per-channel difference to flag a pixel as changed.
+
+    Returns
+    -------
+    np.ndarray or None
+        A uint8 binary mask (255 = changed), or ``None`` if either
+        input is ``None``.
+    """
     if img_a is None or img_b is None:
         return None
 
@@ -508,6 +585,27 @@ def _difference_mask(img_a: np.ndarray, img_b: np.ndarray,
 
 def _highlight_differences(img: np.ndarray, compare_img: np.ndarray,
                            highlight_color: tuple[int, int, int]) -> np.ndarray:
+    """
+    Produce an image with changed regions tinted in *highlight_color*.
+
+    Blends the base image with a solid colour at 45% opacity inside
+    regions that differ from *compare_img*, and draws contour outlines
+    around those regions for clarity.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        The base image to annotate.
+    compare_img : np.ndarray
+        The counterpart image from the other slot (A or B).
+    highlight_color : tuple[int, int, int]
+        BGR colour used for the tint and contour lines.
+
+    Returns
+    -------
+    np.ndarray
+        BGR uint8 image with difference regions highlighted.
+    """
     base = _to_bgr(_as_uint8(img))
     mask = _difference_mask(img, compare_img)
     if mask is None or not np.any(mask):
@@ -554,6 +652,33 @@ def _build_grid_canvas(results: dict, cols: int = 4,
                        cell_w: int = 320, cell_h: int = 260,
                        compare_results: dict | None = None,
                        highlight_color: tuple[int, int, int] | None = None) -> np.ndarray:
+    """
+    Compose all pipeline stage images into a labelled grid canvas.
+
+    Arranges thumbnail versions of every available stage result into
+    a multi-row grid on a dark background.  When *compare_results* and
+    *highlight_color* are provided, each cell is annotated with
+    difference highlighting against the corresponding compare image.
+
+    Parameters
+    ----------
+    results : dict
+        Stage-key-to-image mapping from ``_run_pipeline``.
+    cols : int
+        Number of columns in the grid layout.
+    cell_w, cell_h : int
+        Pixel dimensions of each thumbnail cell.
+    compare_results : dict or None
+        Results from the opposing slot, used for difference highlighting.
+    highlight_color : tuple[int, int, int] or None
+        BGR colour for the difference overlay; required when
+        *compare_results* is not ``None``.
+
+    Returns
+    -------
+    np.ndarray
+        BGR uint8 image of the assembled grid, ready for display.
+    """
     keys = [k for k in STAGE_KEYS if k in results]
     rows = (len(keys) + cols - 1) // cols
     label_h, pad = 20, 4
@@ -580,7 +705,17 @@ def _build_grid_canvas(results: dict, cols: int = 4,
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PipelineWorker(QThread):
-    """Runs _run_pipeline on a background thread; emits Qt signals for progress."""
+    """
+    QThread wrapper that runs ``_run_pipeline`` off the main thread.
+
+    Each worker is created for a specific slot ("a" or "b") with a
+    snapshot of the current image, parameters, and skip flags.  It
+    emits ``progress`` signals during execution so the UI can update
+    a progress bar, and emits ``result_ready`` or ``error`` when
+    finished.  A running worker can be cancelled via ``cancel()``,
+    which causes ``_run_pipeline`` to raise ``_PipelineCancelled``
+    at the next progress checkpoint.
+    """
     progress   = pyqtSignal(int, str)   # (percent 0-100, stage name)
     result_ready = pyqtSignal(str, dict)  # (slot "a"/"b", results dict)
     error      = pyqtSignal(str, str)   # (slot, error message)
@@ -597,6 +732,15 @@ class PipelineWorker(QThread):
         self._cancelled = True
 
     def run(self):
+        """
+        Execute the pipeline and emit results or errors.
+
+        Called automatically by ``QThread.start()``.  Passes a progress
+        callback into ``_run_pipeline`` that checks the cancellation
+        flag at each stage boundary.  On success, emits
+        ``result_ready(slot, results)``.  On error (unless cancelled),
+        emits ``error(slot, traceback_string)``.
+        """
         def _cb(pct: int, name: str):
             if self._cancelled:
                 return False
@@ -619,6 +763,16 @@ class PipelineWorker(QThread):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ParamRow(QWidget):
+    """
+    Single-parameter row widget containing a label, a spin box, and a
+    reset button.
+
+    Used inside ``ParamPanel`` to expose one numeric pipeline parameter.
+    The spin box type (``QSpinBox`` or ``QDoubleSpinBox``) is chosen
+    automatically based on whether the parameter is floating-point.
+    Emits ``value_changed(name, value)`` whenever the user adjusts the
+    spin box.
+    """
     value_changed = pyqtSignal(str, object)
 
     def __init__(self, name, default, lo, hi, step, is_float=False, tooltip="", parent=None):
@@ -673,7 +827,15 @@ class ParamRow(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ParamPanel(QScrollArea):
-    """Scrollable panel containing all param rows + skip checkboxes for one slot."""
+    """
+    Scrollable panel containing all parameter rows and skip checkboxes.
+
+    One instance is created for each slot (A and B).  The panel groups
+    parameters by pipeline stage inside collapsible ``QGroupBox`` widgets,
+    with skip checkboxes at the top of each group.  Emits ``changed``
+    whenever any parameter or skip checkbox is modified, so the main
+    window can debounce and re-run the pipeline.
+    """
     changed = pyqtSignal()   # emitted whenever any value changes
 
     def __init__(self, parent=None):
@@ -694,6 +856,7 @@ class ParamPanel(QScrollArea):
         for spec in PARAM_SPECS:
             name, lo, hi, step, is_float, group = spec
 
+            # Start a new group box when the stage label changes
             if group != current_group:
                 current_group = group
                 gb = QGroupBox(group)
@@ -702,6 +865,7 @@ class ParamPanel(QScrollArea):
                 group_lay.setContentsMargins(4, 8, 4, 4)
                 lay.addWidget(gb)
 
+                # Place skip checkboxes at the top of their group
                 for skip_key, skip_label in _SKIP_BY_GROUP.get(group, []):
                     cb = QCheckBox(skip_label)
                     cb.setChecked(False)
@@ -737,29 +901,51 @@ class ParamPanel(QScrollArea):
         self.changed.emit()
 
     def get_params(self) -> dict:
+        """Return a dict of all current parameter values keyed by name."""
         return {name: row.get_value() for name, row in self._rows.items()}
 
     def get_skips(self) -> dict:
+        """Return a dict of all current skip-checkbox states keyed by stage shorthand."""
         return {key: cb.isChecked() for key, cb in self._skip_cbs.items()}
 
     def get_state(self) -> dict:
+        """Return the full panel state (params + skips) as a serialisable dict."""
         return {
             "params": self.get_params(),
             "skips": self.get_skips(),
         }
 
     def set_params(self, params: dict):
+        """
+        Restore parameter values from a dict without triggering change signals.
+
+        Parameters
+        ----------
+        params : dict
+            Parameter names mapped to their numeric values.  Keys not
+            present in *params* are left unchanged.
+        """
         for name, row in self._rows.items():
             if name in params:
                 row.set_value(params[name])
 
     def set_skips(self, skips: dict):
+        """
+        Restore skip-checkbox states from a dict without triggering signals.
+
+        Parameters
+        ----------
+        skips : dict
+            Stage shorthands mapped to bool.  Keys not present are left
+            unchanged.
+        """
         for key, cb in self._skip_cbs.items():
             cb.blockSignals(True)
             cb.setChecked(skips.get(key, False))
             cb.blockSignals(False)
 
     def reset_all(self):
+        """Reset every parameter to its default value and uncheck all skips."""
         for name, row in self._rows.items():
             row.set_value(DEFAULTS[name])
         for cb in self._skip_cbs.values():
@@ -768,6 +954,7 @@ class ParamPanel(QScrollArea):
             cb.blockSignals(False)
 
     def apply_state(self, state: dict):
+        """Apply a combined params + skips state dict (e.g. from a preset file)."""
         self.set_params(state.get("params", {}))
         self.set_skips(state.get("skips", {}))
 
@@ -777,7 +964,16 @@ class ParamPanel(QScrollArea):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ImagePane(QWidget):
-    """Display area for one slot's pipeline results, with a progress bar."""
+    """
+    Display widget for one slot's pipeline results.
+
+    Contains a coloured header label identifying the slot (A or B),
+    a thin progress bar shown during pipeline execution, and a
+    scrollable image area.  Supports two display modes: single-stage
+    (one large image) and grid (all stages tiled).  When compare mode
+    is active, difference highlighting can be applied against the
+    opposing slot's results.
+    """
 
     def __init__(self, label_text: str, label_color: str, parent=None):
         super().__init__(parent)
@@ -861,6 +1057,24 @@ class ImagePane(QWidget):
         self.results = results
 
     def refresh(self, mode: str, stage_key: str, compare_results: dict | None = None):
+        """
+        Update the displayed image for the current view mode and stage.
+
+        In single-stage mode, displays one full-size image (optionally
+        with difference highlighting).  In grid mode, composes all
+        pipeline stages into a labelled thumbnail grid that fits within
+        the scroll viewport.
+
+        Parameters
+        ----------
+        mode : str
+            ``"single"`` for one stage at a time, or ``"grid"`` for all.
+        stage_key : str
+            Which pipeline stage to show (only used in single mode).
+        compare_results : dict or None
+            Results from the opposing slot; when provided, difference
+            highlighting is applied using the pane's accent colour.
+        """
         if not self.results:
             return
         vw = self.scroll.viewport().width() - 4
@@ -900,6 +1114,20 @@ class ImagePane(QWidget):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    """
+    Top-level application window for the interactive pipeline explorer.
+
+    Manages two independent parameter slots (A and B), each with its
+    own ``ParamPanel`` and ``ImagePane``.  Slot A is always visible;
+    slot B appears when compare mode is enabled, allowing side-by-side
+    evaluation of different parameter configurations on the same image.
+
+    The window coordinates pipeline execution through ``PipelineWorker``
+    threads with 250 ms debounce timers to avoid overwhelming the CPU
+    while the user drags sliders.  Stale workers are cancelled
+    gracefully when new parameter changes arrive before the previous
+    run completes.
+    """
 
     # Accent colours for slot A (blue) and slot B (amber)
     _COLOR_A = "#89b4fa"
@@ -934,6 +1162,21 @@ class MainWindow(QMainWindow):
     # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        """
+        Construct the full widget hierarchy for the main window.
+
+        Layout structure (left to right):
+
+        - **Left panel** (fixed 430 px): image open button, compare
+          toggle, difference-highlight checkbox, and a ``QTabWidget``
+          with tabs A and B each containing a ``ParamPanel``, preset
+          save/load buttons, a reset button, and a copy-to-other-slot
+          button.
+        - **Right panel** (stretches): view-mode selector (single /
+          grid), stage dropdown, and a ``QSplitter`` holding
+          ``ImagePane`` A (always visible) and ``ImagePane`` B
+          (visible only in compare mode).
+        """
         central = QWidget()
         self.setCentralWidget(central)
         root_lay = QHBoxLayout(central)
@@ -1111,6 +1354,20 @@ class MainWindow(QMainWindow):
             self._timer_b.start(delay)
 
     def _run_slot(self, slot: str):
+        """
+        Launch a ``PipelineWorker`` for the given slot.
+
+        If a worker is already running for this slot, it is cancelled
+        and a re-run is queued via ``_pending_rerun``.  The pending
+        re-run fires automatically in ``_on_worker_thread_finished``
+        once the cancelled thread exits, ensuring the latest parameter
+        snapshot is always used.
+
+        Parameters
+        ----------
+        slot : str
+            ``"a"`` or ``"b"``.
+        """
         if self.image is None or self._close_requested:
             return
 
@@ -1150,6 +1407,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_worker_result(self, slot: str, results: dict):
+        """Store finished results, update the pane, and refresh the display."""
         pane = self.pane_a if slot == "a" else self.pane_b
         pane.set_done()
         pane.set_results(results)
@@ -1168,6 +1426,15 @@ class MainWindow(QMainWindow):
         print(f"[Pipeline error — slot {slot.upper()}]\n{msg}")
 
     def _on_worker_thread_finished(self, slot: str, worker: PipelineWorker):
+        """
+        Clean up after a worker thread exits and fire any pending re-run.
+
+        When a worker was cancelled because newer parameters arrived,
+        ``_pending_rerun[slot]`` is ``True`` and this method immediately
+        starts a fresh ``_run_slot`` with the latest settings.  If
+        ``_close_requested`` is set, the window closes once all workers
+        have stopped.
+        """
         current_worker = self._worker_a if slot == "a" else self._worker_b
         if current_worker is worker:
             if slot == "a":
@@ -1223,6 +1490,28 @@ class MainWindow(QMainWindow):
         }
 
     def _validate_preset_payload(self, payload: dict) -> tuple[dict, str | None]:
+        """
+        Validate and sanitise a loaded preset JSON payload.
+
+        Checks that the top-level structure contains ``"params"`` and
+        ``"skips"`` dicts, that every parameter value is numeric, and
+        that every skip value is boolean.  Unknown keys are silently
+        dropped so that presets from older/newer versions still load.
+
+        Parameters
+        ----------
+        payload : dict
+            Raw parsed JSON from a preset file.
+
+        Returns
+        -------
+        tuple[dict, str or None]
+            A ``(clean_state, error_message)`` pair.  On success,
+            *error_message* is ``None`` and *clean_state* contains
+            validated ``"params"`` and ``"skips"`` dicts.  On failure,
+            *clean_state* is empty and *error_message* describes the
+            problem.
+        """
         if not isinstance(payload, dict):
             return {}, "Preset file must contain a JSON object."
 
@@ -1254,6 +1543,7 @@ class MainWindow(QMainWindow):
         return {"params": clean_params, "skips": clean_skips}, None
 
     def _save_slot_preset(self, slot: str):
+        """Prompt the user for a file path and save the slot's current state as JSON."""
         suggested = self._default_preset_path(slot)
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1274,6 +1564,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Save failed: {e}")
 
     def _load_slot_preset(self, slot: str):
+        """Prompt the user for a preset file, validate it, and apply it to the slot."""
         suggested = self._default_preset_path(slot)
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1321,6 +1612,15 @@ class MainWindow(QMainWindow):
     # ── Display refresh ───────────────────────────────────────────────────────
 
     def _refresh_display(self):
+        """
+        Re-render both image panes using the current view mode and stage.
+
+        Reads the view-mode combo (single / grid), the selected stage
+        key, and the difference-highlight checkbox to decide how each
+        pane should render.  In compare mode with highlighting enabled,
+        each pane receives the other slot's results so it can overlay
+        changed regions.
+        """
         mode = "single" if self.view_mode.currentText() == "Single stage" else "grid"
         stage_key = self.stage_combo.currentData()
         highlight_diffs = self._compare_mode and self.highlight_diff_cb.isChecked()
@@ -1342,6 +1642,11 @@ class MainWindow(QMainWindow):
         self._refresh_display()
 
     def closeEvent(self, event):
+        """
+        Handle window close by stopping debounce timers and cancelling
+        any in-flight workers.  If workers are still running, the close
+        is deferred until they finish (via ``_on_worker_thread_finished``).
+        """
         self._timer_a.stop()
         self._timer_b.stop()
         self._pending_rerun["a"] = False

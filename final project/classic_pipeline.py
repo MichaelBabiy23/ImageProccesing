@@ -188,7 +188,7 @@ def segment_adaptive(image):
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
         ADAPTIVE_BLOCK_SIZE,
-        ADAPTIVE_C # we got to C after intense testing (landed on -12)
+        ADAPTIVE_C  # constant subtracted from weighted mean; negative = bright foreground
     )
     return mask
 
@@ -329,7 +329,21 @@ def remove_small_components(mask, min_area=None, baseline_row=None):
 
 def detect_baseline_row(mask):
     """
-    Detect a baseline row where the bottom substrate region starts.
+    Detect the row where the substrate baseline begins.
+
+    Scans downward from BASELINE_DETECT_SEARCH_START_RATIO looking for the
+    first row where the foreground ratio exceeds BASELINE_DETECT_MIN_ROW_RATIO.
+    In SEM images, the substrate appears as a dense bright band at the bottom.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask (0 or 255), dtype uint8.
+
+    Returns
+    -------
+    baseline_row : int or None
+        Row index of the detected baseline, or None if not found.
     """
     if mask is None or mask.ndim != 2 or mask.size == 0:
         return None
@@ -345,7 +359,22 @@ def detect_baseline_row(mask):
 
 def zero_below_baseline(mask, baseline_row):
     """
-    Zero baseline row and everything below it.
+    Zero the baseline row and everything below it.
+
+    Removes the substrate region from the mask to prevent it from being
+    included in the segmentation output.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Binary mask (0 or 255), dtype uint8.
+    baseline_row : int or None
+        Row index of the baseline. If None, mask is returned unchanged.
+
+    Returns
+    -------
+    out : np.ndarray
+        Mask with substrate region zeroed out.
     """
     if baseline_row is None:
         return mask

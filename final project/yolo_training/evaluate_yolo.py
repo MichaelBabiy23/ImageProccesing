@@ -24,6 +24,7 @@ TEST_DIR     = SCRIPT_DIR / "yolo_dataset/test/images"
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def safe_float(val):
+    """Convert a value to float, returning None for NaN or invalid inputs."""
     try:
         v = float(val)
         return v if (v == v) else None   # exclude NaN
@@ -39,11 +40,13 @@ def dice_from_iou(iou: float) -> float:
 # ── 1. Training-curve stats from results.csv ──────────────────────────────────
 
 def load_results():
+    """Load YOLO training results from CSV into a list of row dicts."""
     rows = list(csv.DictReader(open(RESULTS_CSV)))
     return rows
 
 
 def best_epoch(rows):
+    """Return the row dict with the highest mask mAP@0.50."""
     return max(
         rows,
         key=lambda r: safe_float(r["metrics/mAP50(M)"]) or 0.0
@@ -51,6 +54,7 @@ def best_epoch(rows):
 
 
 def print_training_summary(rows):
+    """Print formatted training summary: best/last epoch metrics for mask and box."""
     best = best_epoch(rows)
     last = rows[-1]
 
@@ -102,6 +106,7 @@ def print_training_summary(rows):
 # ── 2. Robustness analysis ────────────────────────────────────────────────────
 
 def robustness_analysis(rows):
+    """Analyze training stability: mAP variance, NaN losses, and per-window trends."""
     print("\n── ROBUSTNESS ANALYSIS ──────────────────────────────────────────────")
 
     # Collect valid mAP50(M) values per epoch
@@ -161,6 +166,7 @@ def robustness_analysis(rows):
 # ── 3. Failure analysis ───────────────────────────────────────────────────────
 
 def failure_analysis(rows):
+    """Print detailed failure analysis: dataset size, loss instability, mAP ceiling."""
     print("\n── FAILURE ANALYSIS ─────────────────────────────────────────────────")
 
     print("""
@@ -219,6 +225,7 @@ def failure_analysis(rows):
 # ── 4. Per-image inference (if ultralytics available) ─────────────────────────
 
 def per_image_eval():
+    """Run best.pt inference on every image and compute per-image IoU and Dice."""
     print("── PER-IMAGE EVALUATION (best.pt on all splits) ─────────────────────")
     try:
         from ultralytics import YOLO
@@ -299,6 +306,7 @@ def per_image_eval():
 # ── 5. Quick IoU / Dice table from mAP thresholds ────────────────────────────
 
 def iou_dice_table(best):
+    """Print a formatted table of IoU, Dice, F1 derived from best-epoch metrics."""
     print("\n── IoU / DICE SCORE SUMMARY ─────────────────────────────────────────")
     print("  (Derived from training-time validation metrics at best epoch)\n")
     print(f"  {'Metric':<35} {'Value':>10}")
@@ -341,6 +349,7 @@ def iou_dice_table(best):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    """Run the full YOLO evaluation report: training summary, metrics, robustness, failures."""
     if not RESULTS_CSV.exists():
         print(f"ERROR: results.csv not found at {RESULTS_CSV}")
         sys.exit(1)

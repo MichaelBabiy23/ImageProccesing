@@ -87,8 +87,8 @@ def run_orchestrator(images_dir, gt_dir=None, yolo_model=None, output_dir=None):
         if not os.path.isfile(yolo_model):
             print(f"  WARNING: YOLO model not found: {yolo_model} — skipping")
         else:
-            from yolo_pipeline import predict_batch
-            yolo_results = predict_batch(yolo_model, images_dir, yolo_dir)
+            from yolo_pipeline import predict_directory
+            yolo_results = predict_directory(yolo_model, images_dir, yolo_dir)
             print(f"  -> {len(yolo_results)} masks generated\n")
     else:
         print("[Stage 2/5] Skipping YOLO pipeline (no model provided)\n")

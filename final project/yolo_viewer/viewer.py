@@ -120,9 +120,17 @@ QStatusBar {{
 """
 
 # ---------------------------------------------------------------------------
-# Signal bridge (worker → main thread)
+# Signal bridge (worker -> main thread)
 # ---------------------------------------------------------------------------
 class WorkerSignals(QObject):
+    """Qt signal bridge for communicating results from background threads
+    back to the main GUI thread.
+
+    Each signal corresponds to a specific async operation (inference,
+    model loading, composite rendering, batch export) and carries
+    the result payload needed by its slot on the main thread.
+    """
+
     infer_done      = Signal(object, str)   # (pred_masks_list or None, msg)
     model_loaded    = Signal(bool, str)
     composite_ready = Signal(object)        # QImage
@@ -151,6 +159,18 @@ def load_gt_polygons(label_path: Path, img_w: int, img_h: int):
 
 
 def ensure_bgr(img):
+    """Convert grayscale or single-channel images to 3-channel BGR.
+
+    Parameters
+    ----------
+    img : np.ndarray or None
+        Input image in any channel configuration.
+
+    Returns
+    -------
+    np.ndarray or None
+        3-channel BGR image, or None if input is None.
+    """
     if img is None:
         return img
     if len(img.shape) == 2:
@@ -250,14 +270,28 @@ def draw_pred_layer(base_bgr, masks_data):
 
 
 def bgr_to_qimage(bgr):
+    """Convert a BGR numpy array to a QImage in RGB888 format.
+
+    Parameters
+    ----------
+    bgr : np.ndarray
+        Input image in BGR channel order.
+
+    Returns
+    -------
+    QImage
+        A deep-copied QImage suitable for display in Qt widgets.
+    """
     bgr = normalize_to_uint8(bgr)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     rgb = np.ascontiguousarray(rgb)
     h, w, _ = rgb.shape
+    # .copy() ensures the QImage owns its data after the numpy array is freed
     return QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888).copy()
 
 
 def get_test_images():
+    """Return sorted list of image paths from the default test directory."""
     if TEST_IMG_DIR.exists():
         return sorted([p for p in TEST_IMG_DIR.iterdir()
                        if p.suffix.lower() in IMAGE_EXTS])
@@ -267,7 +301,7 @@ def get_test_images():
 def label_path_for(img_path: Path) -> Path:
     """
     Find a matching .txt label for an image, trying multiple locations:
-    1. Sibling labels/ folder  (e.g. .../split/images/foo.png → .../split/labels/foo.txt)
+    1. Sibling labels/ folder  (e.g. .../split/images/foo.png -> .../split/labels/foo.txt)
     2. Same folder as the image
     3. Any labels/ folder anywhere under the dataset root
     Returns the first match that exists, or a non-existent path if none found.
@@ -295,12 +329,25 @@ def label_path_for(img_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Image canvas  –  plain QWidget, draws in paintEvent
-#   No Qt layout involvement at all — immune to resize side-effects
-#   • scroll-wheel  → zoom in/out anchored to cursor
-#   • right-button drag → pan
+# Image canvas  -  plain QWidget, draws in paintEvent
+#   No Qt layout involvement at all - immune to resize side-effects
+#   - scroll-wheel  -> zoom in/out anchored to cursor
+#   - right-button drag -> pan
 # ---------------------------------------------------------------------------
 class ImageCanvas(QWidget):
+    """Zoomable and pannable image display widget.
+
+    Renders a QPixmap directly via ``paintEvent`` rather than using QLabel,
+    giving full control over zoom and pan behaviour without interference
+    from Qt's layout system.
+
+    Interaction
+    -----------
+    - Scroll wheel zooms in/out, anchored to the cursor position.
+    - Right-click drag pans the image.
+    - On resize the view recentres automatically.
+    """
+
     ZOOM_STEP = 0.15
     ZOOM_MIN  = 0.05
     ZOOM_MAX  = 16.0
@@ -317,21 +364,36 @@ class ImageCanvas(QWidget):
         self._offset   = [0, 0] # pan offset in screen pixels
         self._drag_pos = None
 
-    # ── public API ──────────────────────────────────────────────────────
+    # -- public API ---------------------------------------------------------
     def set_pixmap(self, pixmap: QPixmap):
+        """Replace the displayed image and reset zoom/pan to fit the widget.
+
+        Parameters
+        ----------
+        pixmap : QPixmap
+            The full-resolution composite image to display.
+        """
         self._pixmap = pixmap
         self._reset_view()
         self.update()
 
     def clear_image(self):
+        """Remove the current image and reset the viewport to its blank state."""
         self._pixmap = None
         self._zoom   = 1.0
         self._offset = [0, 0]
         self.update()
 
-    # ── internals ───────────────────────────────────────────────────────
+    # -- internals ----------------------------------------------------------
     def _fit_scale(self) -> float:
-        """Scale so the image fills the widget at zoom=1, any aspect ratio."""
+        """Compute the scale factor that fits the full image inside the widget.
+
+        Returns
+        -------
+        float
+            Uniform scale factor (min of width-fit and height-fit) so the
+            entire image is visible at zoom=1.
+        """
         if not self._pixmap:
             return 1.0
         w, h = self.width(), self.height()
@@ -346,6 +408,7 @@ class ImageCanvas(QWidget):
         self._offset = [0, 0]
 
     def _img_size(self):
+        """Return the (width, height) of the image at the current zoom level."""
         scale = self._fit_scale() * self._zoom
         return int(self._pixmap.width() * scale), int(self._pixmap.height() * scale)
 
@@ -356,8 +419,9 @@ class ImageCanvas(QWidget):
         y = (self.height() - ih) // 2 + self._offset[1]
         return x, y
 
-    # ── events ──────────────────────────────────────────────────────────
+    # -- events -------------------------------------------------------------
     def paintEvent(self, event):
+        """Draw the current pixmap (if any) centred and scaled, or a placeholder."""
         from PySide6.QtGui import QPainter
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -373,23 +437,24 @@ class ImageCanvas(QWidget):
         painter.drawPixmap(x, y, iw, ih, self._pixmap)
 
     def resizeEvent(self, event):
-        # Reset pan offset when widget resizes so image stays centred
+        """Reset pan offset on resize so the image stays centred."""
         self._offset = [0, 0]
         super().resizeEvent(event)
         self.update()
 
     def wheelEvent(self, event):
+        """Zoom in/out anchored to the current cursor position."""
         if self._pixmap is None:
             return
         delta  = event.angleDelta().y()
         factor = (1 + self.ZOOM_STEP) if delta > 0 else (1 - self.ZOOM_STEP)
         new_zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, self._zoom * factor))
 
-        # Anchor zoom to cursor position
+        # Anchor zoom to cursor position: adjust pan offset so the pixel
+        # under the cursor stays fixed on screen after the zoom change
         cx = event.position().x()
         cy = event.position().y()
         x0, y0 = self._draw_origin()
-        # Pixel in image space under cursor
         ratio = new_zoom / self._zoom
         self._offset[0] = int(cx - (cx - x0) * ratio - (self.width()  - int(self._pixmap.width()  * self._fit_scale() * new_zoom)) // 2)
         self._offset[1] = int(cy - (cy - y0) * ratio - (self.height() - int(self._pixmap.height() * self._fit_scale() * new_zoom)) // 2)
@@ -398,12 +463,14 @@ class ImageCanvas(QWidget):
         event.accept()
 
     def mousePressEvent(self, event):
+        """Begin panning on right-button press."""
         if event.button() == Qt.RightButton and self._pixmap is not None:
             self._drag_pos = event.globalPosition().toPoint()
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
 
     def mouseMoveEvent(self, event):
+        """Update pan offset while dragging with the right mouse button."""
         if self._drag_pos is not None:
             delta = event.globalPosition().toPoint() - self._drag_pos
             self._drag_pos = event.globalPosition().toPoint()
@@ -413,6 +480,7 @@ class ImageCanvas(QWidget):
             event.accept()
 
     def mouseReleaseEvent(self, event):
+        """End panning on right-button release."""
         if event.button() == Qt.RightButton:
             self._drag_pos = None
             self.setCursor(Qt.ArrowCursor)
@@ -423,6 +491,16 @@ class ImageCanvas(QWidget):
 # Main window
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
+    """Primary application window for the YOLO Dendrite Segmentation Viewer.
+
+    Provides a sidebar for model loading, image selection, and batch export,
+    alongside a central ``ImageCanvas`` that renders the selected SEM image
+    with optional ground-truth and YOLO prediction overlays.
+
+    All YOLO inference and image compositing runs on background threads to
+    keep the GUI responsive; results are delivered back via ``WorkerSignals``.
+    """
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Dendrite YOLO Viewer")
@@ -430,7 +508,7 @@ class MainWindow(QMainWindow):
 
         self.model = None
         self._image_paths: list[Path] = []
-        self._pred_cache: dict[Path, list] = {}  # path → list of (H,W) mask arrays
+        self._pred_cache: dict[Path, list] = {}  # path -> list of (H,W) mask arrays
         self._current_bgr      = None
         self._current_gt_polys = []
         self._current_pred_masks = []
@@ -448,6 +526,21 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _build_ui(self):
+        """Construct the full widget hierarchy: sidebar, toggle bar, and canvas.
+
+        Layout structure::
+
+            QMainWindow
+              QSplitter (horizontal)
+                sidebar (fixed 260px)
+                  Model group   - path field, browse, load button
+                  Images group  - list widget, add/clear buttons
+                  Run / Export All buttons, progress bar
+                right panel
+                  toggle bar    - GT / Prediction checkboxes, export button
+                  ImageCanvas   - zoomable/pannable image display
+              QStatusBar
+        """
         central = QWidget()
         self.setCentralWidget(central)
         root = QHBoxLayout(central)
@@ -458,7 +551,7 @@ class MainWindow(QMainWindow):
         splitter.setHandleWidth(3)
         root.addWidget(splitter)
 
-        # ── Left sidebar ──────────────────────────────────────────────
+        # -- Left sidebar --------------------------------------------------
         sidebar = QWidget()
         sidebar.setFixedWidth(260)
         sl = QVBoxLayout(sidebar)
@@ -471,15 +564,15 @@ class MainWindow(QMainWindow):
         mg.setSpacing(6)
         row = QHBoxLayout()
         self.model_edit = QLineEdit(str(MODEL_PATH))
-        self.model_edit.setPlaceholderText("Path to .pt…")
-        browse_btn = QPushButton("…")
+        self.model_edit.setPlaceholderText("Path to .pt...")
+        browse_btn = QPushButton("...")
         browse_btn.setFixedWidth(30)
         browse_btn.setObjectName("secondary")
         browse_btn.clicked.connect(self._browse_model)
         row.addWidget(self.model_edit)
         row.addWidget(browse_btn)
         mg.addLayout(row)
-        load_btn = QPushButton("⚡  Load Model")
+        load_btn = QPushButton("  Load Model")
         load_btn.clicked.connect(self._load_model_async)
         mg.addWidget(load_btn)
         self.model_status = QLabel("Not loaded")
@@ -508,12 +601,12 @@ class MainWindow(QMainWindow):
         ig.addLayout(btn_row)
         sl.addWidget(img_grp, stretch=1)
 
-        self.run_btn = QPushButton("▶  Run YOLO")
+        self.run_btn = QPushButton("  Run YOLO")
         self.run_btn.setEnabled(False)
         self.run_btn.clicked.connect(self._run_yolo)
         sl.addWidget(self.run_btn)
 
-        self.export_all_btn = QPushButton("📦  Export All")
+        self.export_all_btn = QPushButton("  Export All")
         self.export_all_btn.setObjectName("secondary")
         self.export_all_btn.setToolTip("Run YOLO on every image in the list and save to output folder")
         self.export_all_btn.setEnabled(False)
@@ -528,7 +621,7 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(sidebar)
 
-        # ── Right: toggle bar + canvas ────────────────────────────────
+        # -- Right: toggle bar + canvas ------------------------------------
         right = QWidget()
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -572,7 +665,7 @@ class MainWindow(QMainWindow):
 
         tb.addStretch()
 
-        self.export_btn = QPushButton("💾  Export")
+        self.export_btn = QPushButton("  Export")
         self.export_btn.setObjectName("secondary")
         self.export_btn.setToolTip("Save current image with YOLO prediction overlay (full resolution)")
         self.export_btn.setEnabled(False)
@@ -598,10 +691,12 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _populate_test_images(self):
+        """Load images from the default test directory into the list widget."""
         for p in get_test_images():
             self._add_to_list(p)
 
     def _add_to_list(self, path: Path):
+        """Append an image path to the list widget, skipping duplicates."""
         if path in self._image_paths:
             return
         self._image_paths.append(path)
@@ -610,6 +705,7 @@ class MainWindow(QMainWindow):
         self.image_list.addItem(item)
 
     def _clear_list(self):
+        """Remove all images from the list and reset all viewer state."""
         self.image_list.clear()
         self._image_paths.clear()
         self._pred_cache.clear()
@@ -621,6 +717,7 @@ class MainWindow(QMainWindow):
         self.info_label.setText("")
 
     def _browse_model(self):
+        """Open a file dialog to select a YOLO .pt weights file."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Select YOLO model", str(SCRIPT_DIR / "yolo_training"),
             "PyTorch weights (*.pt);;All (*.*)")
@@ -628,12 +725,14 @@ class MainWindow(QMainWindow):
             self.model_edit.setText(path)
 
     def _load_model_async(self):
-        self.model_status.setText("Loading…")
+        """Kick off model loading on a background thread, showing progress."""
+        self.model_status.setText("Loading...")
         self.model_status.setStyleSheet(f"color: {WARNING};")
         self.progress.setVisible(True)
         threading.Thread(target=self._load_model_worker, daemon=True).start()
 
     def _load_model_worker(self):
+        """Background thread: import ultralytics and load the YOLO model."""
         try:
             from ultralytics import YOLO
             m = YOLO(self.model_edit.text())
@@ -643,23 +742,26 @@ class MainWindow(QMainWindow):
             self._signals.model_loaded.emit(False, str(e))
 
     def _on_model_loaded(self, ok, msg):
+        """Slot: update UI after model loading completes or fails."""
         self.progress.setVisible(False)
         if ok:
-            self.model_status.setText(f"✓  {msg}")
+            self.model_status.setText(f"  {msg}")
             self.model_status.setStyleSheet(f"color: {SUCCESS};")
             self.status_bar.showMessage(f"Model loaded: {msg}")
         else:
-            self.model_status.setText("✗  Failed")
+            self.model_status.setText("  Failed")
             self.model_status.setStyleSheet(f"color: {DANGER};")
             self.status_bar.showMessage(f"Error: {msg}")
         self._update_run_btn()
 
     def _update_run_btn(self):
+        """Enable or disable the Run and Export All buttons based on current state."""
         has_model = self.model is not None
         self.run_btn.setEnabled(has_model and self.image_list.currentRow() >= 0)
         self.export_all_btn.setEnabled(has_model and len(self._image_paths) > 0)
 
     def _browse_images(self):
+        """Open a file dialog to add one or more images to the list."""
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select images", str(SCRIPT_DIR),
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All (*.*)")
@@ -667,6 +769,17 @@ class MainWindow(QMainWindow):
             self._add_to_list(Path(p))
 
     def _on_row_changed(self, row):
+        """Slot: load and display the newly selected image from the list.
+
+        Reads the image from disk, looks up its ground-truth label file,
+        restores any cached YOLO predictions, and triggers a composite
+        refresh to update the canvas.
+
+        Parameters
+        ----------
+        row : int
+            Index of the selected row in the image list (-1 if deselected).
+        """
         if row < 0:
             return
         path = self._image_paths[row]
@@ -690,23 +803,31 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(bool(cached))
 
         self.canvas.clear_image()
-        self.info_label.setText(f"{w}×{h}  |  {gt_info}")
+        self.info_label.setText(f"{w}x{h}  |  {gt_info}")
         self._refresh_composite()
         self._update_run_btn()
         pred_info = f"{len(cached)} prediction(s) cached" if cached else "no predictions yet"
-        self.status_bar.showMessage(f"{path.name}  —  {gt_info}  |  {pred_info}")
+        self.status_bar.showMessage(f"{path.name}  -  {gt_info}  |  {pred_info}")
 
     def _run_yolo(self):
+        """Launch YOLO inference on the currently selected image in a background thread."""
         row = self.image_list.currentRow()
         if row < 0 or not self.model:
             return
         path = self._image_paths[row]
         self.run_btn.setEnabled(False)
         self.progress.setVisible(True)
-        self.status_bar.showMessage(f"Running inference on {path.name}…")
+        self.status_bar.showMessage(f"Running inference on {path.name}...")
         threading.Thread(target=self._infer_worker, args=(path,), daemon=True).start()
 
     def _infer_worker(self, path):
+        """Background thread: run YOLO model on a single image and emit results.
+
+        Parameters
+        ----------
+        path : Path
+            Filesystem path to the image to run inference on.
+        """
         try:
             bgr = load_image_bgr(path)
             if bgr is None:
@@ -721,11 +842,12 @@ class MainWindow(QMainWindow):
             else:
                 masks = []
             n = len(masks)
-            self._signals.infer_done.emit(masks, f"{n} prediction(s) — {path.name}")
+            self._signals.infer_done.emit(masks, f"{n} prediction(s) - {path.name}")
         except Exception as e:
             self._signals.infer_done.emit(None, f"Inference error: {e}")
 
     def _on_infer_done(self, masks, msg):
+        """Slot: store prediction masks, update overlays, and re-enable the Run button."""
         self.progress.setVisible(False)
         self.run_btn.setEnabled(True)
         if masks is None:
@@ -740,6 +862,11 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(msg)
 
     def _export_image(self):
+        """Save the current image with its YOLO prediction overlay to a user-chosen file.
+
+        Builds the full-resolution composite (optionally including GT overlay)
+        and writes it via ``cv2.imwrite``.
+        """
         if self._current_bgr is None or not self._current_pred_masks:
             return
         stem = self._current_path.stem if self._current_path else "export"
@@ -761,6 +888,13 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Failed to save: {path}")
 
     def _export_all(self):
+        """Batch-export every image in the list with YOLO prediction overlays.
+
+        Prompts for an output directory, then runs inference (or uses cached
+        masks) for each image on a background thread, saving results as
+        ``<stem>_yolo.png``. Progress is reported via the status bar and
+        progress bar.
+        """
         if not self.model or not self._image_paths:
             return
         out_dir = QFileDialog.getExistingDirectory(
@@ -808,24 +942,33 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_batch_progress(self, done, total, filename):
+        """Slot: update the progress bar and status bar during batch export."""
         self.progress.setValue(done)
         self.status_bar.showMessage(f"Exporting {done+1}/{total}: {filename}")
 
     def _on_batch_done(self, out_dir):
+        """Slot: re-enable UI and show completion message after batch export."""
         self.progress.setVisible(False)
         self.export_all_btn.setEnabled(True)
         self._update_run_btn()
-        self.status_bar.showMessage(f"Export complete → {out_dir}")
+        self.status_bar.showMessage(f"Export complete -> {out_dir}")
 
     # ------------------------------------------------------------------
     # Composite: offload drawing to a background thread
     # ------------------------------------------------------------------
     def _refresh_composite(self):
+        """Rebuild and display the overlay composite image.
+
+        Snapshots the current base image and overlay data, then renders
+        the composite (base + optional GT + optional prediction) on a
+        background thread to avoid blocking the GUI. The result is
+        delivered via the ``composite_ready`` signal.
+        """
         if self._current_bgr is None:
             self.canvas.clear_image()
             return
 
-        # Snapshot everything — worker is fully self-contained, no shared state
+        # Snapshot everything -- worker is fully self-contained, no shared state
         bgr        = self._current_bgr
         gt_polys   = self._current_gt_polys[:]   if self.cb_gt.isChecked()   else []
         pred_masks = self._current_pred_masks[:] if self.cb_pred.isChecked() else []
@@ -844,11 +987,13 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_composite_ready(self, image):
+        """Slot: push the finished composite QImage onto the canvas."""
         self.canvas.set_pixmap(QPixmap.fromImage(image))
 
 
 # ---------------------------------------------------------------------------
 def main():
+    """Entry point: create the QApplication, apply the dark theme, and show the window."""
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     palette = QPalette()

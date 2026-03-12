@@ -173,7 +173,7 @@ def clean_sem_image(image):
         Cleaned image.
     """
     cleaned = remove_scale_bar(image)
-    cleaned = remove_text_overlay(cleaned) # TODO there is a good chance we don't need this since in the images all text appears on the bar anyway
+    cleaned = remove_text_overlay(cleaned)
     return cleaned
 
 
